@@ -530,6 +530,7 @@ void Analysis::Run() {
         }
     }
     EhContinuations();
+    SetjmpContinuations();
     // every direct call from decoded code names a function
     for (bool changed = true; changed;) {
         changed = false;
@@ -556,6 +557,22 @@ void Analysis::Run() {
     std::fprintf(stderr, "overlapping decodes: %zu\n", overlaps);
     std::fprintf(stderr, "total: %zu functions, %zu instructions, %zu code bytes of %u, %zu jump tables, %zu callback entries\n",
                  functions.size(), insns_.size(), bytes, hi_ - lo_, jump_tables.size(), imm);
+}
+
+// setjmp returns a second time when longjmp jumps to the saved return address: that address is a continuation
+// like a C++ catch's, and the function holding the call catches the X86Resume the jump throws
+void Analysis::SetjmpContinuations() {
+    if (cfg.setjmp.empty()) return;
+    std::vector<std::pair<uint32_t, uint32_t>> sites;
+    for (auto& [va, insn] : insns_)
+        if (insn.flow == Flow::Call && cfg.setjmp.count(insn.target)) sites.push_back({va, va + insn.len});
+    for (auto [call, next] : sites) {
+        MakeFunction(next);
+        if (!functions.count(next)) continue;
+        continuations.insert(next);
+        setjmp_sites.insert(call);
+    }
+    std::fprintf(stderr, "setjmp: %zu calls\n", setjmp_sites.size());
 }
 
 void Analysis::MakeFunction(uint32_t va) {

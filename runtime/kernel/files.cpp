@@ -525,6 +525,10 @@ KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
             G<uint8_t>(out + 0x15) = f->dir;  // Directory, after DeletePending
             IoStatus(iosb, kSuccess, 0x18);
             return kSuccess;
+        case 6:  // FileInternalInformation: a number unique to the file (XFONT asks for it)
+            W64(out, std::hash<std::string>()(f->host.string()));
+            IoStatus(iosb, kSuccess, 8);
+            return kSuccess;
         case 14:  // FilePositionInformation
             W64(out, f->pos);
             IoStatus(iosb, kSuccess, 8);

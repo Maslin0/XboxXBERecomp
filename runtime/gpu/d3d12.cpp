@@ -916,7 +916,11 @@ void D3D12Backend::Submit(bool wait) {
     }
 }
 
-void D3D12Backend::Flush() { Submit(true); }
+// a title that waits on a visibility test before it presents gets its reports here
+void D3D12Backend::Flush() {
+    Submit(true);
+    DeliverReports();
+}
 
 void D3D12Backend::WaitFence(uint64_t value) {
     fence_->SetEventOnCompletion(value, event_);

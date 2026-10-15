@@ -34,6 +34,7 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
             LOGE("audio: XAudio2 unavailable, no sound");
             return;
         }
+        if (GetEnvironmentVariableA("STEAL_MUTE", nullptr, 0)) master->SetVolume(0.0f);  // silent test runs
         voice->Start();
         constexpr uint32_t kFrames = kRate / 100, kSlots = 4;
         std::vector<float> bufs(kSlots * kFrames * 2);

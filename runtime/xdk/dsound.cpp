@@ -43,6 +43,58 @@ X86Func* Find(uint32_t guest);
 #define SYM_IDirectSound_GetOutputLevels FFFFFF04
 #define HAS_IDirectSound_GetOutputLevels 0
 #endif
+#ifndef SYM_IDirectSoundBuffer_SetPitch
+#define SYM_IDirectSoundBuffer_SetPitch FFFFFF40
+#define HAS_IDirectSoundBuffer_SetPitch 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetEG
+#define SYM_IDirectSoundBuffer_SetEG FFFFFF41
+#define HAS_IDirectSoundBuffer_SetEG 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_GetVoiceProperties
+#define SYM_IDirectSoundBuffer_GetVoiceProperties FFFFFF42
+#define HAS_IDirectSoundBuffer_GetVoiceProperties 0
+#endif
+#ifndef SYM_IDirectSoundStream_SetPitch
+#define SYM_IDirectSoundStream_SetPitch FFFFFF43
+#define HAS_IDirectSoundStream_SetPitch 0
+#endif
+#ifndef SYM_IDirectSoundStream_GetVoiceProperties
+#define SYM_IDirectSoundStream_GetVoiceProperties FFFFFF44
+#define HAS_IDirectSoundStream_GetVoiceProperties 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetLFO
+#define SYM_IDirectSoundBuffer_SetLFO FFFFFF50
+#define HAS_IDirectSoundBuffer_SetLFO 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_Set3DVoiceData
+#define SYM_IDirectSoundBuffer_Set3DVoiceData FFFFFF51
+#define HAS_IDirectSoundBuffer_Set3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_Use3DVoiceData
+#define SYM_IDirectSoundBuffer_Use3DVoiceData FFFFFF52
+#define HAS_IDirectSoundBuffer_Use3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundStream_SetLFO
+#define SYM_IDirectSoundStream_SetLFO FFFFFF53
+#define HAS_IDirectSoundStream_SetLFO 0
+#endif
+#ifndef SYM_IDirectSoundStream_Set3DVoiceData
+#define SYM_IDirectSoundStream_Set3DVoiceData FFFFFF54
+#define HAS_IDirectSoundStream_Set3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundStream_Use3DVoiceData
+#define SYM_IDirectSoundStream_Use3DVoiceData FFFFFF55
+#define HAS_IDirectSoundStream_Use3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundStream_SetOutputBuffer
+#define SYM_IDirectSoundStream_SetOutputBuffer FFFFFF56
+#define HAS_IDirectSoundStream_SetOutputBuffer 0
+#endif
+#ifndef SYM_IDirectSound_CreateSoundStream
+#define SYM_IDirectSound_CreateSoundStream FFFFFF60
+#define HAS_IDirectSound_CreateSoundStream 0
+#endif
 #ifndef SYM_IDirectSoundBuffer_SetPlayRegion
 #define SYM_IDirectSoundBuffer_SetPlayRegion FFFFFF05
 #define HAS_IDirectSoundBuffer_SetPlayRegion 0
@@ -586,6 +638,20 @@ HLE_STDCALL(IDirectSound_GetOutputLevels, 3) {
 
 // buffers
 
+uint32_t PitchToHz(int32_t pitch) { return uint32_t(48000.0 * std::exp2(pitch / 4096.0) + 0.5); }
+// DSVOICEPROPS: mix bin count, 8 bin and volume pairs, then pitch and five 3D and I3DL2 levels
+void WriteVoiceProperties(const Voice& v, uint32_t out) {
+    if (!out) return;
+    std::memset(HostPtr(out), 0, 4 + 8 * 8 + 6 * 4);
+    W32(out, v.nbins);
+    for (uint32_t i = 0; i < v.nbins; i++) {
+        W32(out + 4 + i * 8, v.bin[i]);
+        W32(out + 8 + i * 8, uint32_t(v.bin_mb[v.bin[i]]));
+    }
+    uint32_t hz = v.freq ? v.freq : v.rate;
+    W32(out + 4 + 8 * 8, uint32_t(int32_t(std::lround(4096.0 * std::log2(hz / 48000.0)))));
+}
+
 HLE_STDCALL(DirectSoundCreateBuffer, 2) { return NewBuffer(a[0], a[1]); }
 HLE_STDCALL(IDirectSound_CreateSoundBuffer, 4) { return NewBuffer(a[1], a[2]); }
 
@@ -689,6 +755,20 @@ BUFFER(SetFrequency, 2) {
     return 0;
 }
 BUFFER(SetFilter, 2) { return 0; }
+// (this, pitch): 1/4096 octaves from 48 kHz, as SetFrequency stores it
+BUFFER(SetPitch, 2) {
+    v.freq = PitchToHz(int32_t(a[1]));
+    return 0;
+}
+// envelopes, LFOs and the title's own 3D voice data are not played
+BUFFER(SetEG, 2) { return 0; }
+BUFFER(SetLFO, 2) { return 0; }
+BUFFER(Set3DVoiceData, 2) { return 0; }
+BUFFER(Use3DVoiceData, 2) { return 0; }
+BUFFER(GetVoiceProperties, 2) {
+    WriteVoiceProperties(v, a[1]);
+    return 0;
+}
 BUFFER(SetHeadroom, 2) {
     v.headroom = Db(-int32_t(a[1]));
     return 0;
@@ -739,12 +819,15 @@ BUFFER(SetFormat, 2) {
 
 // streams, the object carries the XDK's own vtable
 
-HLE_STDCALL(DirectSoundCreateStream, 2) {
+static uint32_t NewStream(uint32_t desc, uint32_t out);
+HLE_STDCALL(DirectSoundCreateStream, 2) { return NewStream(a[0], a[1]); }
+// (this, desc, out, unknown)
+HLE_STDCALL(IDirectSound_CreateSoundStream, 4) { return NewStream(a[1], a[2]); }
+static uint32_t NewStream(uint32_t desc, uint32_t out) {
     XDK_REQUIRE("dsound", XDK_KEY(CDirectSoundStream_Vtable), XDK_KEY(CDirectSoundStream_Vtable2),
                 XDK_DATA(DSound_StreamVtable), XDK_DATA(DSound_StreamVtable2));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Start();
-    uint32_t desc = a[0];
     uint32_t obj = mem::AllocSystem(0x80);
     std::memset(HostPtr(obj), 0, 0x80);
     W32(obj + XDK_CDirectSoundStream_Vtable, kStreamVtable);
@@ -760,7 +843,7 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     SetBins(v, R32(desc + 20));
     v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
     v.headroom = DefaultHeadroom(flags);
-    W32(a[1], obj);
+    W32(out, obj);
     return 0;
 }
 
@@ -863,6 +946,22 @@ STREAM(SetFrequency, 2) {
     return 0;
 }
 STREAM(SetFilter, 2) { return 0; }
+// the IDirectSoundStream thunks of these call stream methods the signatures do not know
+HLE_STDCALL(IDirectSoundStream_SetPitch, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (Voice* v = Find(a[0])) v->freq = PitchToHz(int32_t(a[1]));
+    return 0;
+}
+HLE_STDCALL(IDirectSoundStream_SetLFO, 2) { return 0; }
+HLE_STDCALL(IDirectSoundStream_Set3DVoiceData, 2) { return 0; }
+HLE_STDCALL(IDirectSoundStream_Use3DVoiceData, 2) { return 0; }
+// (this, mix-in buffer): submixes are not routed, the stream plays to its own mix bins
+HLE_STDCALL(IDirectSoundStream_SetOutputBuffer, 2) { return 0; }
+HLE_STDCALL(IDirectSoundStream_GetVoiceProperties, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (Voice* v = Find(a[0])) WriteVoiceProperties(*v, a[1]);
+    return 0;
+}
 // the library's own writes voice registers a host stream does not have; envelopes are not played
 HLE_STDCALL(IDirectSoundStream_SetEG, 2) { return 0; }
 STREAM(SetHeadroom, 2) {

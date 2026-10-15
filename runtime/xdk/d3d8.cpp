@@ -28,6 +28,18 @@ using namespace kernel;
 #define SYM_D3DDevice_EndPush FFFFFE01
 #define HAS_D3DDevice_EndPush 0
 #endif
+#ifndef SYM_D3DDevice_RunPushBuffer
+#define SYM_D3DDevice_RunPushBuffer FFFFFE05
+#define HAS_D3DDevice_RunPushBuffer 0
+#endif
+#ifndef SYM_D3DDevice_GetVisibilityTestResult
+#define SYM_D3DDevice_GetVisibilityTestResult FFFFFE04
+#define HAS_D3DDevice_GetVisibilityTestResult 0
+#endif
+// CDevice's table of visibility report blocks, 256 reports of 16 bytes each (XDK 5849)
+#ifndef XDK_CDevice_VisibilityReports
+#define XDK_CDevice_VisibilityReports 0x7D4u
+#endif
 #ifndef HAS_D3D_FvfShader
 #define HAS_D3D_FvfShader 0
 #endif
@@ -72,6 +84,20 @@ constexpr uint32_t kDevPush = XDK_CDevice_Push, kDevThreshold = XDK_CDevice_Push
 constexpr uint32_t kStageStates = XDK_TextureState_Stage, kStreamSize = XDK_Stream_Size;
 
 gpu::State g_state;
+
+// Hardware vertex state a title pushes itself, past the API: some engines load vertex programs and constants and
+// point the vertex arrays with their own commands, then run recorded index lists (RunPushBuffer). Those draws take
+// their shader and streams from here.
+struct RawVertex {
+    std::array<uint32_t, 136 * 4> program{};  // transform program memory, 136 instructions
+    uint32_t load = 0, start = 0;             // SET_TRANSFORM_PROGRAM_LOAD, _START, in instructions
+    uint32_t load_word = 0;                   // dword within the instruction being loaded
+    uint32_t const_load = 0, const_word = 0;  // SET_TRANSFORM_CONSTANT_LOAD, hardware register order
+    std::array<uint32_t, 16> offset{}, format{};  // SET_VERTEX_DATA_ARRAY_OFFSET, _FORMAT
+    bool arrays = false;                      // the title has pointed the arrays itself
+    std::array<uint32_t, 16> headers{};       // vertex buffer headers the streams point at
+};
+RawVertex g_raw;
 std::unique_ptr<gpu::Backend> g_backend;
 std::recursive_mutex g_lock;
 
@@ -846,8 +872,11 @@ HLE_STDCALL(D3DDevice_LoadVertexShader, 2) {
     LOG_FIRST(4, "d3d: LoadVertexShader %08X at %u is not supported", a[0], a[1]);
     return 0;
 }
+// (handle, slot): the title's own program memory runs from the slot; its arrays are pointed by its own commands
 HLE_STDCALL(D3DDevice_SelectVertexShader, 2) {
-    LOG_FIRST(4, "d3d: SelectVertexShader %08X at %u is not supported", a[0], a[1]);
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Walk(Dev(kDevPush));
+    g_raw.start = a[1];
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetShaderConstantMode, 1) {
@@ -1051,13 +1080,119 @@ void EndPrimitive() {
 
 // reads the commands pushed since the last call: vertex data between a begin and an end is drawn, visibility tests
 // are run, the rest is skipped
+
+// methods of the transform program, constants and vertex arrays; false for any other
+bool ApplyRawMethod(uint32_t m, uint32_t v) {
+    constexpr uint32_t kProgram = 0x0B00, kConstant = 0x0B80, kArrayOffset = 0x1720, kArrayFormat = 0x1760,
+                       kProgramLoad = 0x1E9C, kProgramStart = 0x1EA0, kConstantLoad = 0x1EA4;
+    if (m >= kProgram && m < kProgram + 0x80) {
+        if (g_raw.load < 136) g_raw.program[g_raw.load * 4 + g_raw.load_word] = v;
+        if (++g_raw.load_word == 4) {
+            g_raw.load_word = 0;
+            g_raw.load++;
+        }
+    } else if (m >= kConstant && m < kConstant + 0x80) {
+        if (g_raw.const_load < 192) {
+            float f;
+            std::memcpy(&f, &v, 4);
+            g_state.vsc[g_raw.const_load][g_raw.const_word] = f;
+        }
+        if (++g_raw.const_word == 4) {
+            g_raw.const_word = 0;
+            g_raw.const_load++;
+        }
+    } else if (m >= kArrayOffset && m < kArrayOffset + 0x40) {
+        g_raw.offset[(m - kArrayOffset) / 4] = v;
+        g_raw.arrays = true;
+    } else if (m >= kArrayFormat && m < kArrayFormat + 0x40) {
+        g_raw.format[(m - kArrayFormat) / 4] = v;
+        g_raw.arrays = true;
+    } else if (m == kProgramLoad) {
+        g_raw.load = v;
+        g_raw.load_word = 0;
+    } else if (m == kProgramStart) {
+        g_raw.start = v;
+    } else if (m == kConstantLoad) {
+        g_raw.const_load = v;
+        g_raw.const_word = 0;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// the state a draw of the title's own arrays sees: the program from the start slot to its last instruction, each
+// enabled array a stream of its own read from register r
+gpu::State RawDrawState() {
+    gpu::State s = g_state;
+    std::vector<uint32_t> program;
+    for (uint32_t i = g_raw.start; i < 136; i++) {
+        program.insert(program.end(), &g_raw.program[i * 4], &g_raw.program[i * 4 + 4]);
+        if (g_raw.program[i * 4 + 3] & 1) break;  // the final instruction
+    }
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint32_t w) { h = (h ^ w) * 1099511628211ull; };
+    for (uint32_t w : program) mix(w);
+    for (uint32_t r = 0; r < 16; r++) mix(g_raw.format[r] & 0xFF);
+    // the render thread tells shaders apart by pointer: one object per program and layout
+    static std::unordered_map<uint64_t, std::shared_ptr<gpu::VertexShader>> made;
+    auto& vs = made[h];
+    if (!vs) {
+        vs = std::make_shared<gpu::VertexShader>();
+        vs->handle = 1;
+        vs->program = program;
+        vs->program_type = 0x2078;
+        for (uint32_t r = 0; r < 16; r++) {
+            uint32_t f = g_raw.format[r];
+            if (!((f >> 4) & 0xF)) continue;  // size 0: disabled
+            vs->inputs[r] = {int(r), 0, f & 0xFF};
+            vs->stream_stride[r] = f >> 8;
+        }
+    }
+    s.vs = vs;
+    s.vs_handle = 1;
+    for (uint32_t r = 0; r < 16; r++) {
+        if (!g_raw.headers[r]) {
+            g_raw.headers[r] = mem::AllocSystem(20);
+            std::memset(HostPtr(g_raw.headers[r]), 0, 20);
+            W32(g_raw.headers[r], 1);  // a vertex buffer, one reference
+        }
+        W32(g_raw.headers[r] + 4, g_raw.offset[r] & 0x7FFFFFFF);  // bit 31 picks the second vertex DMA context
+        s.streams[r] = {g_raw.headers[r], g_raw.format[r] >> 8};
+    }
+    s.base_vertex = 0;
+    return s;
+}
+
+// XBE_PUSH_STATS=1: every 5 s, the hardware methods titles pushed themselves that Walk let pass
+void PushStat(uint32_t m) {
+    static const bool on = std::getenv("XBE_PUSH_STATS") != nullptr;
+    if (!on) return;
+    static std::map<uint32_t, uint32_t> counts;
+    static auto last = std::chrono::steady_clock::now();
+    counts[m]++;
+    if (std::chrono::steady_clock::now() - last < std::chrono::seconds(5)) return;
+    last = std::chrono::steady_clock::now();
+    std::string out;
+    char b[24];
+    for (auto& [k, n] : counts) {
+        std::snprintf(b, sizeof(b), " %X:%u", k, n);
+        out += b;
+    }
+    LOGE("push stats:%s", out.c_str());
+    counts.clear();
+}
+
 void Walk(uint32_t end) {
     if (!g_walk || end < g_walk || end > g_scratch_push + g_scratch_size) return;
     for (uint32_t p = g_walk; p + 4 <= end;) {
         // count in bits 18 to 28, bit 30 keeps the method for every value
         uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
         p += 4;
-        if ((head & 0xA0030003) || n * 4 > end - p) break;  // anything but a method header
+        if ((head & 0xA0030003) || n * 4 > end - p) {  // anything but a method header
+            PushStat(0xF0000000u | (head & 0xE0000003u));
+            break;
+        }
         for (uint32_t i = 0; i < n; i++, p += 4) {
             uint32_t m = head & 0x40000000 ? method : method + i * 4, v = R32(p);
             float f, *a = g_im_attr;
@@ -1094,6 +1229,7 @@ void Walk(uint32_t end) {
                 last = m == 0x1524;
                 a[(m - 0x1518) / 4] = f;
             } else {
+                if (!ApplyRawMethod(m, v)) PushStat(m);
                 continue;
             }
             if (!g_im_prim) continue;
@@ -1155,6 +1291,81 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
     g_push_begin = 0;
     ScratchPush();
     return a[0];
+}
+
+// (index, result out, timestamp out): a report still pending is flushed through, as the console's GPU would
+// have reached it by the time a title spins on it
+HLE_STDCALL(D3DDevice_GetVisibilityTestResult, 3) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Walk(Dev(kDevPush));
+    uint32_t dev = R32(kDevicePtr), block = R32(dev + XDK_CDevice_VisibilityReports + (a[0] >> 8) * 4);
+    if (!block) return 0x88760828u;  // D3DERR_TESTINCOMPLETE
+    uint32_t report = block + (a[0] & 0xFF) * 16;
+    if (R32(report + 12) == 0xFFFFFFFFu && g_backend) g_backend->Flush();
+    if (R32(report + 12) == 0xFFFFFFFFu) return 0x88760828u;
+    if (a[1]) W32(a[1], R32(report + 8));
+    if (a[2]) {
+        W32(a[2], R32(report));
+        W32(a[2] + 4, R32(report + 4));
+    }
+    return 0;
+}
+
+// RunPushBuffer(push buffer, fixups): a recorded command buffer runs against the state set through the API. The
+// titles seen record indexed draws in them: BEGIN_END around ARRAY_ELEMENT16 (two 16 bit indices a dword) and
+// ARRAY_ELEMENT32 (one index, an odd count's last), drawn here as DrawIndexedVertices would. Inline vertices and
+// other methods go the way EndPush takes them.
+HLE_STDCALL(D3DDevice_RunPushBuffer, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    constexpr uint32_t kBeginEnd = 0x17FC, kElement16 = 0x1800, kElement32 = 0x1808, kInlineArray = 0x1818;
+    static std::vector<uint16_t> indices;
+    static std::vector<uint32_t> vertices;
+    if (a[1]) LOG_FIRST(4, "d3d: RunPushBuffer fixups %08X are not applied", a[1]);
+    uint32_t pb = a[0], data = R32(pb + 4), size = R32(pb + 12);
+    if (int32_t(R32(pb)) < 0) LOG_FIRST(4, "d3d: RunPushBuffer of a copied buffer %08X", pb);
+    Walk(Dev(kDevPush));
+    SyncDeferred();
+    uint32_t prim = 0;
+    bool wide = false;
+    for (uint32_t p = data, end = data + size; p + 4 <= end;) {
+        uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
+        p += 4;
+        if ((head & 0xA0030003) || n * 4 > end - p) {
+            LOG_FIRST(8, "d3d: RunPushBuffer stops at command %08X, %u bytes before the end", head, end - p);
+            break;
+        }
+        for (uint32_t i = 0; i < n; i++, p += 4) {
+            uint32_t m = head & 0x40000000 ? method : method + i * 4, v = R32(p);
+            if (m == kElement16 || (m > kElement16 && m < kElement32 && !(head & 0x40000000))) {
+                indices.push_back(uint16_t(v));
+                indices.push_back(uint16_t(v >> 16));
+            } else if (m == kElement32) {
+                if (v > 0xFFFF) wide = true;
+                indices.push_back(uint16_t(v));
+            } else if (m == kInlineArray) {
+                if (prim) vertices.push_back(v);
+            } else if (m != kBeginEnd) {
+                ApplyVisibilityMethod(m, v);
+                if (!ApplyRawMethod(m, v) && m >> 2 < g_state.simple.size()) g_state.simple[m >> 2] = v;
+            } else if (v) {
+                prim = v;
+                indices.clear();
+                vertices.clear();
+            } else if (prim) {
+                if (wide) LOG_FIRST(4, "d3d: RunPushBuffer index above 65535 cut to 16 bits");
+                if (!indices.empty() && g_backend)
+                    g_backend->Draw(g_raw.arrays ? RawDrawState() : g_state, prim, 0, uint32_t(indices.size()),
+                                    reinterpret_cast<const uint8_t*>(indices.data()));
+                if (!vertices.empty()) {
+                    uint32_t stride = VertexBytes(), bytes = uint32_t(vertices.size()) * 4;
+                    if (stride && bytes % stride == 0) DrawUp(prim, bytes / stride, vertices.data(), stride);
+                }
+                prim = 0;
+                wide = false;
+            }
+        }
+    }
+    return 0;
 }
 
 // frame buffer compression tiles are the console's memory controller's business
