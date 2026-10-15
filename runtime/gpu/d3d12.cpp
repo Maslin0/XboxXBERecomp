@@ -670,8 +670,9 @@ private:
     std::unordered_map<uint32_t, uint64_t> target_used_;  // target address to the frame it was last used
     // small colour targets drawn this frame, and every target ever sampled: one drawn and never sampled is read by
     // the CPU without a lock (auto exposure), so it goes back to guest memory a frame late at each present
-    std::unordered_set<uint32_t> small_drawn_, sampled_;
+    std::unordered_set<uint32_t> small_drawn_, sampled_, small_pending_;
     void WriteBackSmall();
+    bool DeliverCopy(uint32_t data, bool any_age);
     std::unordered_map<uint64_t, Tex> textures_;  // by data address, a P8 texture's with its palette's above
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
     Extension* ext_ = nullptr;
@@ -3119,7 +3120,10 @@ void D3D12Backend::SyncLate(uint32_t data) {
     RecordLate(data);
 }
 
-bool D3D12Backend::DeliverLate(uint32_t data) {
+bool D3D12Backend::DeliverLate(uint32_t data) { return DeliverCopy(data, false); }
+
+// any_age: a copy recorded frames ago still counts (a small target drawn now and then, read by the CPU any time later)
+bool D3D12Backend::DeliverCopy(uint32_t data, bool any_age) {
     std::lock_guard lock(late_lock_);
     auto it = late_.find(data);
     if (it == late_.end()) return false;
@@ -3129,7 +3133,7 @@ bool D3D12Backend::DeliverLate(uint32_t data) {
     int best = -1;
     for (int i = 0; i < kFrames; i++) {
         bool finished = l.fence[i] && l.fence[i] <= done;
-        bool recent = now - l.frame[i] <= uint64_t(kFrames) + 1;
+        bool recent = any_age || now - l.frame[i] <= uint64_t(kFrames) + 1;
         bool newest = best < 0 || l.fence[i] > l.fence[best];
         if (finished && recent && newest) best = i;
     }
@@ -3206,13 +3210,20 @@ void D3D12Backend::RecordLateCopy(Late& l, uint32_t slot, ID3D12Resource* src) {
     l.next = (slot + 1) % kFrames;
 }
 
+// small targets the GPU never samples are what the CPU reads (the game's auto exposure averages a 16x16 one that is
+// drawn only every few frames): each gets a copy when drawn, delivered to guest memory once the GPU has finished it
 void D3D12Backend::WriteBackSmall() {
-    static const bool off = std::getenv("STEAL_NO_WB") != nullptr;
-    if (off) small_drawn_.clear();
+    for (auto it = small_pending_.begin(); it != small_pending_.end();) {
+        DeliverCopy(*it, true);
+        std::lock_guard lock(late_lock_);
+        const Late& l = late_[*it];
+        uint64_t newest = *std::max_element(std::begin(l.fence), std::end(l.fence));
+        it = l.delivered >= newest ? small_pending_.erase(it) : std::next(it);
+    }
     for (uint32_t data : small_drawn_) {
         if (sampled_.count(data)) continue;
-        DeliverLate(data);
         RecordLate(data);
+        small_pending_.insert(data);
     }
     small_drawn_.clear();
 }
