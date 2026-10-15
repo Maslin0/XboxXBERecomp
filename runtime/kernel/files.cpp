@@ -480,7 +480,8 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     if (f->fp) Seek(f->fp, pos);
     uint32_t n = 0;
     while (n < len) {
-        uint32_t at = pages ? R32(pages + n / 0x1000 * 8) + n % 0x1000 : buf + n;
+        // the console's FILE_SEGMENT_ELEMENT is one 32 bit page pointer, not the 64 bit union of Windows
+        uint32_t at = pages ? R32(pages + n / 0x1000 * 4) + n % 0x1000 : buf + n;
         uint32_t chunk = pages ? std::min(len - n, 0x1000 - n % 0x1000) : len;
         size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
                       : write  ? std::fwrite(HostPtr(at), 1, chunk, f->fp)
