@@ -791,14 +791,30 @@ HLE_STDCALL(IDirectSound_CreateSoundBuffer, 4) { return NewBuffer(a[1], a[2]); }
     }                                                       \
     static uint32_t buf_##name([[maybe_unused]] Voice& v, [[maybe_unused]] const Args& a)
 
-BUFFER(Release, 1) {
-    if (--v.refs > 0) return uint32_t(v.refs);
-    if (v.owned) mem::FreeContiguous(v.owned);
-    uint32_t obj = v.obj;
+// a buffer's last reference gone: it goes, and lets go of the mix-in buffer it played through
+static void DropBuffer(uint32_t obj) {
+    Voice* v = Find(obj);
+    if (!v || --v->refs > 0) return;
+    if (v->owned) mem::FreeContiguous(v->owned);
+    uint32_t out = v->output;
     for (auto& [other, w] : g_voices)
         if (w.output == obj) w.output = 0;
     g_voices.erase(obj);
     mem::FreeSystem(obj);
+    if (out) DropBuffer(out);
+}
+// SetOutputBuffer holds a reference on the mix-in buffer, as the console's does: XACT releases a submix while its
+// sounds still play through it, and a source that lost it would sound at full volume on its own bins
+static void SetOutput(Voice& v, uint32_t out) {
+    if (out == v.output) return;
+    if (Voice* o = out ? Find(out) : nullptr) o->refs++;
+    uint32_t old = v.output;
+    v.output = out;
+    if (old) DropBuffer(old);
+}
+BUFFER(Release, 1) {
+    if (v.refs > 1) return uint32_t(--v.refs);
+    DropBuffer(v.obj);
     return 0;
 }
 BUFFER(Unlock, 5) { return 0; }
@@ -949,7 +965,7 @@ BUFFER(SetRolloffCurve, 4) {
     return 0;
 }
 BUFFER(SetOutputBuffer, 2) {
-    v.output = a[1];
+    SetOutput(v, a[1]);
     return 0;
 }
 BUFFER(SetFormat, 2) {
@@ -1032,9 +1048,10 @@ STREAM(SetFormat, 2) {
 STREAM(Release, 1) {
     if (--v.refs > 0) return uint32_t(v.refs);
     FlushStream(v);
-    uint32_t obj = v.obj;
+    uint32_t obj = v.obj, out = v.output;
     g_voices.erase(obj);
     mem::FreeSystem(obj);
+    if (out) DropBuffer(out);
     return 0;
 }
 STREAM(GetInfo, 2) {
@@ -1103,7 +1120,7 @@ HLE_STDCALL(IDirectSoundStream_Use3DVoiceData, 2) { return 0; }
 // (this, mix-in buffer): XACT plays every voice through a submix it pans
 HLE_STDCALL(IDirectSoundStream_SetOutputBuffer, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    if (Voice* v = Find(a[0])) v->output = a[1];
+    if (Voice* v = Find(a[0])) SetOutput(*v, a[1]);
     return 0;
 }
 HLE_STDCALL(IDirectSoundStream_GetVoiceProperties, 2) {
