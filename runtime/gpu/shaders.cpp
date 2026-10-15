@@ -346,13 +346,13 @@ struct Ps {
         std::string ab = (fl & 2) ? "dot(" + A + ", " + B + ")" : "(" + A + " * " + B + ")";
         std::string cd = (fl & 1) ? "dot(" + C + ", " + D + ")" : "(" + C + " * " + D + ")";
         uint32_t map = fl & 0x38;
-        code += F("%s ab%s = clamp((%s)%s, -1, 1);\n", T, n, T, Map(ab, map).c_str());
-        code += F("%s cd%s = clamp((%s)%s, -1, 1);\n", T, n, T, Map(cd, map).c_str());
+        code += F("%s ab%s = Q(clamp((%s)%s, -1, 1));\n", T, n, T, Map(ab, map).c_str());
+        code += F("%s cd%s = Q(clamp((%s)%s, -1, 1));\n", T, n, T, Map(cd, map).c_str());
         std::string sum = (fl & 4) ? F("((%s) ? (%s)%s : (%s)%s)",
                                        ((k.count >> 8) & 1) ? "r0.a >= 0.5" : "(uint(r0.a * 255) & 1) == 1", T,
                                        cd.c_str(), T, ab.c_str())
                                    : "(" + ab + " + " + cd + ")";
-        code += F("%s ms%s = clamp((%s)%s, -1, 1);\n", T, n, T, Map(sum, map).c_str());
+        code += F("%s ms%s = Q(clamp((%s)%s, -1, 1));\n", T, n, T, Map(sum, map).c_str());
         std::string post;
         if (const char* r = Dest(ab_dst)) {
             post += F("%s.%s = ab%s;\n", r, m, n);
@@ -454,6 +454,9 @@ std::string TexFetch(const PixelKey& k, int i) {
 }
 
 const char* kPsSbyte = R"(
+// the register combiners compute in 8 bit fixed point: each stage's results drop to 1/255 steps, so a faint
+// feedback (bloom history scaled down every frame) dies out as on the console instead of lingering as haze
+#define Q(x) (trunc((x) * 255.0) / 255.0)
 // unorm to byte b, less lo under 128 or hi from 128, over d
 float3 sbyte(float3 u, float lo, float hi, float d) { float3 b = u * 255; return (b - (b >= 128 ? hi : lo)) / d; }
 )";
