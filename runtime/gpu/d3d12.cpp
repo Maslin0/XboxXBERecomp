@@ -2410,6 +2410,12 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
 void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
     float bf[4];
     Color(SimpleState(s, kMBlendColor), bf);
+    // D3D12 has one blend factor: a constant alpha blend (0x8003/0x8004) with no constant colour one weighs every
+    // channel by the constant's alpha (a motion blur that kept its colour weights would never fade its old frames)
+    uint32_t src = SimpleState(s, kMSrcBlend), dst = SimpleState(s, kMDestBlend);
+    auto alpha = [](uint32_t f) { return f == 0x8003 || f == 0x8004; };
+    auto colour = [](uint32_t f) { return f == 0x8001 || f == 0x8002; };
+    if ((alpha(src) || alpha(dst)) && !colour(src) && !colour(dst)) bf[0] = bf[1] = bf[2] = bf[3];
     cl_->OMSetBlendFactor(bf);
     cl_->OMSetStencilRef(SimpleState(s, kMStencilRef) & 0xFF);
 }

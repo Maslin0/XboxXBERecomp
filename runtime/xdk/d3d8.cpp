@@ -43,6 +43,14 @@ using namespace kernel;
 #ifndef HAS_D3D_FvfShader
 #define HAS_D3D_FvfShader 0
 #endif
+#ifndef SYM_D3DDevice_UpdateOverlay
+#define SYM_D3DDevice_UpdateOverlay FFFFFE06
+#define HAS_D3DDevice_UpdateOverlay 0
+#endif
+#ifndef SYM_D3DDevice_GetOverlayUpdateStatus
+#define SYM_D3DDevice_GetOverlayUpdateStatus FFFFFE07
+#define HAS_D3DDevice_GetOverlayUpdateStatus 0
+#endif
 #ifndef SYM_D3DDevice_SetPalette
 #define SYM_D3DDevice_SetPalette FFFFFE02
 #define HAS_D3DDevice_SetPalette 0
@@ -452,6 +460,63 @@ HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {
 HLE_STDCALL(D3DDevice_SetFlickerFilter, 1) { return 0; }
 HLE_STDCALL(D3DDevice_SetSoftDisplayFilter, 1) { return 0; }
 HLE_STDCALL(D3DDevice_EnableOverlay, 1) { return 0; }
+
+// The overlay (movie players show YUY2 frames on it) is not composited with the frame buffer: each update is
+// converted into a back buffer sized surface of its own and presented as the whole picture.
+namespace {
+uint32_t g_overlay = 0;  // that surface
+
+uint8_t Clamp255(int v) { return uint8_t(std::clamp(v, 0, 255)); }
+}  // namespace
+
+// (surface, source RECT, destination RECT, colour key on, colour key): YUY2 to BGRA on the CPU, then presented
+HLE_STDCALL(D3DDevice_UpdateOverlay, 5) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    uint32_t surf = a[0];
+    if (!surf || !g_backend) return 0;
+    uint32_t size = R32(surf + 16), sw = (size & 0xFFF) + 1, sh = (size >> 12 & 0xFFF) + 1;
+    uint32_t spitch = ((size >> 24 & 0xFF) + 1) * 64;
+    const uint8_t* src = static_cast<const uint8_t*>(HostPtr(mem::VirtualFromPhysical(R32(surf + 4))));
+    uint32_t back = R32(g_buffers[0] + 16), w = (back & 0xFFF) + 1, h = (back >> 12 & 0xFFF) + 1;
+    if (!g_overlay) g_overlay = NewSurface(w, h, 0x1E, 4);  // LIN_X8R8G8B8
+    uint32_t pitch = ((R32(g_overlay + 16) >> 24 & 0xFF) + 1) * 64;
+    uint8_t* dst = static_cast<uint8_t*>(HostPtr(mem::VirtualFromPhysical(R32(g_overlay + 4))));
+    auto rect = [](uint32_t r, int32_t def_w, int32_t def_h, int32_t out[4]) {
+        if (r) {
+            for (int i = 0; i < 4; i++) out[i] = int32_t(R32(r + i * 4));
+        } else {
+            out[0] = out[1] = 0;
+            out[2] = def_w;
+            out[3] = def_h;
+        }
+    };
+    // the destination is left out: titles place the overlay inside the TV safe area of their own frame, while
+    // the presented surface is the whole picture, the movie fills it
+    int32_t sr[4], dr[4];
+    rect(a[1], int32_t(sw), int32_t(sh), sr);
+    rect(0, int32_t(w), int32_t(h), dr);
+    int32_t dw = std::max(dr[2] - dr[0], 1), dh = std::max(dr[3] - dr[1], 1);
+    for (uint32_t y = 0; y < h; y++) {
+        uint32_t* row = reinterpret_cast<uint32_t*>(dst + size_t(y) * pitch);
+        for (uint32_t x = 0; x < w; x++) {
+            int32_t ux = int32_t(x) - dr[0], uy = int32_t(y) - dr[1];
+            if (ux < 0 || uy < 0 || ux >= dw || uy >= dh) {
+                row[x] = 0xFF000000;
+                continue;
+            }
+            uint32_t px = std::min<uint32_t>(uint32_t(sr[0] + ux * (sr[2] - sr[0]) / dw), sw - 1);
+            uint32_t py = std::min<uint32_t>(uint32_t(sr[1] + uy * (sr[3] - sr[1]) / dh), sh - 1);
+            const uint8_t* q = src + size_t(py) * spitch + (px & ~1u) * 2;  // Y0 U Y1 V
+            int yv = q[px & 1 ? 2 : 0] - 16, u = q[1] - 128, v = q[3] - 128;
+            int c = 298 * yv + 128;
+            row[x] = 0xFF000000u | Clamp255((c + 409 * v) >> 8) << 16 | Clamp255((c - 100 * u - 208 * v) >> 8) << 8 |
+                     Clamp255((c + 516 * u) >> 8);
+        }
+    }
+    g_backend->Present(SurfaceOf(g_overlay));
+    return 0;
+}
+HLE_STDCALL(D3DDevice_GetOverlayUpdateStatus, 0) { return 1; }
 // the front buffer, read back at the guest size, is kept for the next instance after a quick reboot, which may
 // fade from it at its first frames
 HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
