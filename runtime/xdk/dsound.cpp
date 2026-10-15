@@ -387,10 +387,12 @@ void Render(float* out, uint32_t frames) {
             const Voice* o = v.output ? Find(v.output) : nullptr;
             float og[2][2] = {};
             if (o) Levels(*const_cast<Voice*>(o), og);
-            LOGE("voice %08X %s loop %d egrel %u tag %X ch %u rate %u freq %u vol %.2f head %.2f gain %.2f/%.2f eg %d %.2f -> %08X gain %.2f/%.2f eg %d %.2f played %d playing %d",
+            std::string bins;
+            for (uint32_t b = 0; b < v.nbins; b++) bins += " " + std::to_string(v.bin[b]) + ":" + std::to_string(v.bin_mb[v.bin[b]]);
+            LOGE("voice %08X %s loop %d egrel %u tag %X ch %u rate %u freq %u vol %.2f head %.2f gain %.2f/%.2f eg %d %.2f -> %08X gain %.2f/%.2f eg %d %.2f played %d playing %d bins%s",
                  obj, v.stream ? "stream" : "buffer", int(v.looping), v.eg.release, v.tag, v.channels, v.rate, v.freq, v.volume, v.headroom, g[0][0],
                  g[0][1], int(v.eg.stage), v.eg.level, v.output, og[0][0], og[0][1], o ? int(o->eg.stage) : -1,
-                 o ? o->eg.level : 0.0f, o ? int(o->played) : -1, o ? int(o->playing) : -1);
+                 o ? o->eg.level : 0.0f, o ? int(o->played) : -1, o ? int(o->playing) : -1, bins.empty() ? " front" : bins.c_str());
         }
     }
     // mix-in buffers have no samples of their own: their envelope still runs (XACT fades and stops a sound by
