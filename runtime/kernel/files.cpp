@@ -502,7 +502,17 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
 KERNEL_EXPORT(219, NtReadFile, 8) { return Transfer(a, false, 0); }
 KERNEL_EXPORT(236, NtWriteFile, 8) { return Transfer(a, true, 0); }
 // the buffer argument is an array of one page per element
-KERNEL_EXPORT(220, NtReadFileScatter, 8) { return Transfer(a, false, a[5]); }
+KERNEL_EXPORT(220, NtReadFileScatter, 8) {
+    if (std::getenv("STEAL_IO_LOG")) {
+        std::string st;
+        for (uint32_t i = 0; i < 64; i++) {
+            uint32_t v = R32(ctx.esp + i * 4);
+            if (v >= 0x11000 && v < 0x1C0000) st += " " + std::to_string(i) + ":" + std::to_string(v);
+        }
+        LOGE("io: scatter stack%s", st.c_str());
+    }
+    return Transfer(a, false, a[5]);
+}
 KERNEL_EXPORT(237, NtWriteFileGather, 8) { return Transfer(a, true, a[5]); }
 
 KERNEL_EXPORT(211, NtQueryInformationFile, 5) {
