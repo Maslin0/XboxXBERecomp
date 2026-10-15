@@ -197,16 +197,19 @@ std::recursive_mutex& UiLock() {
 void ApplyDisplay() { PostMessageW(g_hwnd, kApplyDisplay, 0, 0); }
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
 
-void Pace() {
+// vblanks: the console's presentation interval, each frame shown at least that many 60 Hz vertical blanks
+void Pace(uint32_t vblanks) {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
     uint32_t cap = Get().fps_cap;
     auto now = clock::now();
-    if (!cap) {
+    uint64_t ns = cap ? 1000000000ull / cap : 0;
+    ns = std::max<uint64_t>(ns, vblanks * 1000000000ull / 60);
+    if (!ns) {
         next = now;
         return;
     }
-    auto period = std::chrono::nanoseconds(1000000000ull / cap);
+    auto period = std::chrono::nanoseconds(ns);
     next += period;
     if (next < now - period) next = now;
     while (clock::now() + std::chrono::milliseconds(2) < next) Sleep(1);

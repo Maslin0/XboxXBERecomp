@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -488,6 +489,10 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
         if (done < chunk) break;
     }
     f->pos = pos + n;
+    static const bool io_log = std::getenv("STEAL_IO_LOG") != nullptr;
+    if (io_log)
+        LOGE("io: %s %s at %llX len %X -> %X (off %08X event %X apc %X iosb %08X)", write ? "write" : "read",
+             f->host.filename().string().c_str(), (unsigned long long)pos, len, n, off, event, apc, iosb);
     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
     if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
     return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);

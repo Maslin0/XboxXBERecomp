@@ -98,6 +98,7 @@ struct RawVertex {
     std::array<uint32_t, 16> headers{};       // vertex buffer headers the streams point at
 };
 RawVertex g_raw;
+uint32_t g_interval = 0;  // D3DPRESENT_PARAMETERS presentation interval
 void PushStat(uint32_t m);
 gpu::State RawDrawState();
 std::unique_ptr<gpu::Backend> g_backend;
@@ -317,6 +318,7 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     }
     g_state = gpu::State{};
     g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+    g_interval = interval;  // the swap paces to it while the title leaves D3DRS_PRESENTATIONINTERVAL at 0
     SetDev(kDevRenderTarget, g_buffers[1]);
     SetDev(kDevDepth, g_depth);
     SetDev(kDevBackBuffer, g_buffers[1]);
@@ -541,7 +543,12 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     }
     Walk(Dev(kDevPush));  // reports asked for at the end of the frame
     if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
-    app::Pace();
+    // D3DRS_PRESENTATIONINTERVAL from the library's table: a title whose logic counts frames (30 fps under
+    // D3DPRESENT_INTERVAL_TWO) keeps its speed; IMMEDIATE (bit 31) and DEFAULT (0) wait one vblank at most
+    uint32_t interval = R32(kRenderState + gpu::kRsPresentationInterval * 4);
+    if (!interval) interval = g_interval;
+    LOG_FIRST(8, "d3d: presentation interval %X", interval);
+    app::Pace(interval & 0x80000000u ? 0 : std::clamp<uint32_t>(interval & 0xF, 1, 4));
     // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
     uint32_t last = g_buffers[g_buffer_count - 1], data = R32(last + 4), lk = R32(last + 8);
     for (uint32_t i = g_buffer_count - 1; i > 0; i--) {
