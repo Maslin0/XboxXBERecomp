@@ -139,6 +139,57 @@ struct Packet {
     uint32_t used = 0;
 };
 
+// DSENVELOPEDESC amplitude envelope, stepped once per output frame (times in 48 kHz frames)
+struct Envelope {
+    enum Stage { kOff, kDelay, kAttack, kHold, kDecay, kSustain, kRelease, kDone };
+    bool enabled = false;
+    uint32_t delay = 0, attack = 0, hold = 0, decay = 0, release = 0;
+    float sustain = 1, level = 1, release_from = 1;
+    Stage stage = kOff;
+    uint32_t pos = 0;
+    void Start() {
+        pos = 0;
+        stage = !enabled ? kOff : delay ? kDelay : attack ? kAttack : hold ? kHold : decay ? kDecay : kSustain;
+        level = stage == kOff ? 1.0f : stage == kSustain ? sustain : 0.0f;
+    }
+    void Release() {
+        if (!enabled || stage == kRelease || stage == kDone) return;
+        release_from = stage == kOff ? 1.0f : level;
+        stage = release ? kRelease : kDone;
+        pos = 0;
+    }
+    float Next() {
+        switch (stage) {
+            case kOff: return 1.0f;
+            case kDelay:
+                if (++pos >= delay) stage = attack ? kAttack : hold ? kHold : kDecay, pos = 0;
+                return level = 0.0f;
+            case kAttack:
+                level = float(pos) / attack;
+                if (++pos >= attack) stage = hold ? kHold : kDecay, pos = 0;
+                return level;
+            case kHold:
+                if (++pos >= hold) stage = kDecay, pos = 0;
+                return level = 1.0f;
+            case kDecay:
+                if (!decay || pos >= decay) {
+                    stage = kSustain;
+                    return level = sustain;
+                }
+                return level = 1.0f - (1.0f - sustain) * float(pos++) / decay;
+            case kSustain: return level = sustain;
+            case kRelease:
+                if (pos >= release) {
+                    stage = kDone;
+                    return level = 0.0f;
+                }
+                return level = release_from * (1.0f - float(pos++) / release);
+            case kDone: return level = 0.0f;
+        }
+        return 1.0f;
+    }
+};
+
 struct Voice {
     uint32_t obj = 0;
     bool stream = false;
@@ -166,6 +217,8 @@ struct Voice {
     bool is3d = false;
     uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
     float p[3] = {}, min_dist = 1, max_dist = 1e9f;
+    Envelope eg;
+    uint32_t output = 0;  // SetOutputBuffer: the mix-in buffer whose bins, volume and envelope this voice plays through
     // ADPCM block cache
     int64_t block = -1;
     int16_t decoded[65 * 8];
@@ -186,6 +239,11 @@ thread_local std::vector<Done> t_flushed;  // run by the STREAM call that flushe
 std::atomic<int64_t> g_pumped{0};          // the last DirectSoundDoWork, steady ms
 bool g_started = false;
 uint32_t g_ds = 0;
+
+Voice* Find(uint32_t obj) {
+    auto it = g_voices.find(obj);
+    return it == g_voices.end() ? nullptr : &it->second;
+}
 
 float Db(int32_t hundredths) { return hundredths <= -10000 ? 0.0f : std::pow(10.0f, hundredths / 2000.0f); }
 
@@ -265,15 +323,17 @@ void Levels(Voice& v, float g[2][2]) {
     bool speakers = false;
     for (uint32_t s = 0; s < n; s++) speakers |= bin[s] < 10 && bin[s] != 3;
     for (uint32_t c = 0; c < 2; c++) {
-        g[c][0] = g[c][1] = 0;
+        // the speakers fold down to stereo by power: a sound panned around 5.1 keeps its loudness
+        float power[2] = {};
         for (uint32_t s = c; c < v.channels && s < per && s < n; s += step) {
             uint32_t b = bin[s];
             if (speakers && (b == 3 || b > 9)) continue;  // sub and effect sends
-            float x = Db(v.bin_mb[b]) * v.volume * v.headroom * (b == 2 ? 0.707f : 1.0f);
+            float x = Db(v.bin_mb[b]) * (b == 2 ? 0.707f : 1.0f);
             // even bins are left, odd right, 2 is the centre
-            if (!speakers || b == 2 || !(b & 1)) g[c][0] = std::max(g[c][0], x);
-            if (!speakers || b == 2 || (b & 1)) g[c][1] = std::max(g[c][1], x);
+            if (!speakers || b == 2 || !(b & 1)) power[0] += x * x;
+            if (!speakers || b == 2 || (b & 1)) power[1] += x * x;
         }
+        for (int k = 0; k < 2; k++) g[c][k] = std::sqrt(power[k]) * v.volume * v.headroom;
     }
     if (!v.is3d || v.mode == 2) return;
     bool rel = v.mode == 1;  // the position is already in listener space
@@ -309,10 +369,38 @@ void Deactivate(Voice& v) {
 void Render(float* out, uint32_t frames) {
     std::memset(out, 0, frames * 2 * sizeof(float));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    // STEAL_AUDIO_LOG: the sounding voices every 2 s
+    static const bool log_voices = std::getenv("STEAL_AUDIO_LOG") != nullptr;
+    static uint32_t logged = 0;
+    if (log_voices && (logged += frames) >= audio::kRate * 2) {
+        logged = 0;
+        for (auto& [obj, v] : g_voices) {
+            if (v.paused || v.sync || (!v.stream && !v.playing) || (v.stream && v.packets.empty())) continue;
+            float g[2][2];
+            Levels(v, g);
+            const Voice* o = v.output ? Find(v.output) : nullptr;
+            float og[2][2] = {};
+            if (o) Levels(*const_cast<Voice*>(o), og);
+            LOGE("voice %08X %s tag %X ch %u rate %u freq %u vol %.2f head %.2f gain %.2f/%.2f eg %d %.2f -> %08X gain %.2f/%.2f eg %d %.2f",
+                 obj, v.stream ? "stream" : "buffer", v.tag, v.channels, v.rate, v.freq, v.volume, v.headroom, g[0][0],
+                 g[0][1], int(v.eg.stage), v.eg.level, v.output, og[0][0], og[0][1], o ? int(o->eg.stage) : -1,
+                 o ? o->eg.level : 0.0f);
+        }
+    }
     for (auto& [obj, v] : g_voices) {
         if (v.paused || v.sync || (!v.stream && !v.playing)) continue;
         float g[2][2];
         Levels(v, g);
+        float eg_out = 1;
+        if (Voice* o = v.output ? Find(v.output) : nullptr) {
+            // through a submix: its bins pan, its volume and envelope scale, the voice keeps only its own volume
+            float og[2][2];
+            Levels(*o, og);
+            float mine = v.volume * v.headroom;
+            for (int c = 0; c < 2; c++)
+                for (int k = 0; k < 2; k++) g[c][k] = og[std::min<int>(c, o->channels - 1)][k] * mine;
+            eg_out = o->eg.enabled ? o->eg.level : 1.0f;
+        }
         uint32_t base = v.data + v.play_start;
         double step = double(v.freq ? v.freq : v.rate) / audio::kRate;
         for (uint32_t i = 0; i < frames; i++) {
@@ -365,14 +453,32 @@ void Render(float* out, uint32_t frames) {
                 b1 = Sample(v, base, next, 1);
             }
             float t = float(v.pos - f);
-            a += (a1 - a) * t;
-            b += (b1 - b) * t;
+            float e = v.eg.Next() * eg_out;
+            if (v.eg.stage == Envelope::kDone && !v.stream) {  // a released stream stays quiet until resumed
+                v.eg.stage = Envelope::kOff;
+                v.playing = false;
+                v.pos = 0;
+                break;
+            }
+            a = (a + (a1 - a) * t) * e;
+            b = (b + (b1 - b) * t) * e;
             out[i * 2] += a * g[0][0] + b * g[1][0];
             out[i * 2 + 1] += a * g[0][1] + b * g[1][1];
             v.pos += step;
         }
     }
-    for (uint32_t i = 0; i < frames * 2; i++) out[i] = std::clamp(out[i], -1.0f, 1.0f);
+    // a limiter, not clipping: many voices folded to stereo can pass full scale. The gain drops at once and comes
+    // back over half a second.
+    static float limit = 1.0f;
+    constexpr float kCeiling = 0.95f, kRecovery = 1.0f / (audio::kRate * 0.5f);
+    for (uint32_t i = 0; i < frames; i++) {
+        float* f = out + i * 2;
+        float peak = std::max(std::fabs(f[0]), std::fabs(f[1]));
+        if (peak * limit > kCeiling) limit = kCeiling / peak;
+        f[0] = std::clamp(f[0] * limit, -1.0f, 1.0f);
+        f[1] = std::clamp(f[1] * limit, -1.0f, 1.0f);
+        limit = std::min(1.0f, limit + kRecovery);
+    }
 }
 
 int64_t NowMs() {
@@ -427,6 +533,20 @@ void SetBins(Voice& v, uint32_t mixbins) {
     }
     v.nbins = uint8_t(n);
 }
+// DSENVELOPEDESC: EG (0 amplitude), mode (0 off), delay, attack, hold, decay, release in 512 sample units, sustain
+// 0..255. The multi envelope (pitch and filter) is not played.
+void SetEnvelope(Voice& v, uint32_t desc) {
+    if (!desc || R32(desc) != 0) return;
+    Envelope& e = v.eg;
+    e.enabled = R32(desc + 4) != 0;
+    e.delay = R32(desc + 8) * 512;
+    e.attack = R32(desc + 12) * 512;
+    e.hold = R32(desc + 16) * 512;
+    e.decay = R32(desc + 20) * 512;
+    e.release = R32(desc + 24) * 512;
+    e.sustain = std::min<uint32_t>(R32(desc + 28), 255) / 255.0f;
+    if (!e.enabled) e.stage = Envelope::kOff;
+}
 // volumes only, the bins stay
 void SetBinVolumes(Voice& v, uint32_t mixbins) {
     if (!mixbins) return;
@@ -436,10 +556,6 @@ void SetBinVolumes(Voice& v, uint32_t mixbins) {
 // 600 mB unless 3D or a mix in or effect in buffer
 float DefaultHeadroom(uint32_t flags) { return flags & 0x382010 ? 1.0f : Db(-600); }
 
-Voice* Find(uint32_t obj) {
-    auto it = g_voices.find(obj);
-    return it == g_voices.end() ? nullptr : &it->second;
-}
 
 uint32_t NewBuffer(uint32_t desc, uint32_t out) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -668,6 +784,8 @@ BUFFER(Release, 1) {
     if (--v.refs > 0) return uint32_t(v.refs);
     if (v.owned) mem::FreeContiguous(v.owned);
     uint32_t obj = v.obj;
+    for (auto& [other, w] : g_voices)
+        if (w.output == obj) w.output = 0;
     g_voices.erase(obj);
     mem::FreeSystem(obj);
     return 0;
@@ -689,6 +807,7 @@ BUFFER(SetBufferData, 3) {
     return 0;
 }
 BUFFER(Play, 4) {
+    if (!v.playing || (a[3] & 2)) v.eg.Start();
     v.playing = true;
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
@@ -699,9 +818,11 @@ BUFFER(Stop, 1) {
     v.playing = false;
     return 0;
 }
-// (this, time low, time high, flags): stops now, the release envelope is not reproduced
+// (this, time low, time high, flags): DSBSTOPEX_ENVELOPE (1) releases, DSBSTOPEX_RELEASEWAVEFORM (2) plays to the end
 BUFFER(StopEx, 4) {
-    v.playing = false;
+    if (a[3] & 2) v.looping = false;
+    if ((a[3] & 1) && v.eg.enabled && v.eg.release) v.eg.Release();
+    else if (!(a[3] & 2)) v.playing = false;
     return 0;
 }
 // (this, start, length) in bytes, 0 length plays to the end. The loop becomes the whole region.
@@ -760,8 +881,11 @@ BUFFER(SetPitch, 2) {
     v.freq = PitchToHz(int32_t(a[1]));
     return 0;
 }
-// envelopes, LFOs and the title's own 3D voice data are not played
-BUFFER(SetEG, 2) { return 0; }
+// LFOs and the title's own 3D voice data are not played
+BUFFER(SetEG, 2) {
+    SetEnvelope(v, a[1]);
+    return 0;
+}
 BUFFER(SetLFO, 2) { return 0; }
 BUFFER(Set3DVoiceData, 2) { return 0; }
 BUFFER(Use3DVoiceData, 2) { return 0; }
@@ -809,7 +933,10 @@ BUFFER(SetRolloffCurve, 4) {
     for (uint32_t i = 0; a[1] && i < std::min<uint32_t>(a[2], 64); i++) v.curve.push_back(F32(R32(a[1] + i * 4)));
     return 0;
 }
-BUFFER(SetOutputBuffer, 2) { return 0; }  // the voice keeps its own mix bins
+BUFFER(SetOutputBuffer, 2) {
+    v.output = a[1];
+    return 0;
+}
 BUFFER(SetFormat, 2) {
     ReadFormat(v, a[1]);
     v.freq = 0;
@@ -933,6 +1060,7 @@ STREAM(FlushEx, 4) {
     return 0;
 }
 STREAM(Pause, 2) {
+    if (a[1] == 0) v.eg.Start();  // XACT resumes a stream to start each sound
     v.paused = a[1] == 1;
     v.sync = a[1] == 2;
     return 0;
@@ -955,15 +1083,23 @@ HLE_STDCALL(IDirectSoundStream_SetPitch, 2) {
 HLE_STDCALL(IDirectSoundStream_SetLFO, 2) { return 0; }
 HLE_STDCALL(IDirectSoundStream_Set3DVoiceData, 2) { return 0; }
 HLE_STDCALL(IDirectSoundStream_Use3DVoiceData, 2) { return 0; }
-// (this, mix-in buffer): submixes are not routed, the stream plays to its own mix bins
-HLE_STDCALL(IDirectSoundStream_SetOutputBuffer, 2) { return 0; }
+// (this, mix-in buffer): XACT plays every voice through a submix it pans
+HLE_STDCALL(IDirectSoundStream_SetOutputBuffer, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (Voice* v = Find(a[0])) v->output = a[1];
+    return 0;
+}
 HLE_STDCALL(IDirectSoundStream_GetVoiceProperties, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (Voice* v = Find(a[0])) WriteVoiceProperties(*v, a[1]);
     return 0;
 }
-// the library's own writes voice registers a host stream does not have; envelopes are not played
-HLE_STDCALL(IDirectSoundStream_SetEG, 2) { return 0; }
+// the library's own writes voice registers a host stream does not have: the amplitude envelope only
+HLE_STDCALL(IDirectSoundStream_SetEG, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (Voice* v = Find(a[0])) SetEnvelope(*v, a[1]);
+    return 0;
+}
 STREAM(SetHeadroom, 2) {
     v.headroom = Db(-int32_t(a[1]));
     return 0;
