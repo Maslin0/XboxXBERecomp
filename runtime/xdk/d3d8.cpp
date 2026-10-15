@@ -626,7 +626,6 @@ HLE_STDCALL(D3DDevice_SetRenderStateNotInline, 2) {
         return 0;                                     \
     }
 HLE_STDCALL(D3DDevice_SetRenderState_PSTextureModes, 1) {
-    if (std::getenv("STEAL_LOG_MODES")) LOGE("modes: SetRenderState %05X from %08X", a[0], R32(ctx.esp));
     SetComplex(gpu::kRsPsTextureModes, a[0]);
     return 0;
 }
@@ -960,7 +959,6 @@ HLE_STDCALL(D3DDevice_SetPixelShader, 1) {
     put(gpu::kMPsCombinerCount, d[53]);
     put(gpu::kMPsDotMapping, d[55]);
     put(gpu::kMPsInputTexture, d[56]);
-    if (std::getenv("STEAL_LOG_MODES")) LOGE("modes: SetPixelShader %08X def %05X from %08X", a[0], d[54], R32(ctx.esp));
     SetComplex(gpu::kRsPsTextureModes, d[54]);
     return 0;
 }
