@@ -477,6 +477,7 @@ HLE_STDCALL(D3DDevice_SetGammaRamp, 2) {
 
 HLE_STDCALL(D3DDevice_SetRenderTarget, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Walk(Dev(kDevPush));  // a colour offset the title pushed before this belongs to the old target
     uint32_t rt = a[0] ? a[0] : Dev(kDevRenderTarget), zs = a[1];
     AddRef(ctx, rt);
     uint32_t old_rt = Dev(kDevRenderTarget), old_zs = Dev(kDevDepth);
@@ -1133,10 +1134,12 @@ bool ApplyRawMethod(uint32_t m, uint32_t v) {
     } else if (m == kConstantLoad) {
         g_raw.const_load = v;
         g_raw.const_word = 0;
-    } else if (m == 0x030C && !std::getenv("STEAL_NO_ZMAP")) {  // SET_DEPTH_TEST_ENABLE, what SetRenderState_ZEnable pushes
+    } else if (m == 0x030C) {  // SET_DEPTH_TEST_ENABLE, what SetRenderState_ZEnable pushes
         g_state.rs[gpu::kRsZEnable] = v;
-    } else if (m == 0x032C && !std::getenv("STEAL_NO_ZMAP")) {  // SET_STENCIL_TEST_ENABLE
+    } else if (m == 0x032C) {  // SET_STENCIL_TEST_ENABLE
         g_state.rs[gpu::kRsStencilEnable] = v;
+    } else if (m == 0x0210) {  // SET_SURFACE_COLOR_OFFSET: a target of the same size and format, until SetRenderTarget
+        g_state.rt.data = v;
     } else {
         return false;
     }
