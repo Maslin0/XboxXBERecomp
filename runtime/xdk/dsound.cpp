@@ -218,6 +218,7 @@ struct Voice {
     uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
     float p[3] = {}, min_dist = 1, max_dist = 1e9f;
     Envelope eg;
+    bool played = false;  // Play was called: a mix-in buffer stopped afterwards silences its sources
     uint32_t output = 0;  // SetOutputBuffer: the mix-in buffer whose bins, volume and envelope this voice plays through
     // ADPCM block cache
     int64_t block = -1;
@@ -229,6 +230,7 @@ struct Done {
 };
 
 std::recursive_mutex g_lock;
+const bool g_audio_log = std::getenv("STEAL_AUDIO_LOG") != nullptr;  // STEAL_AUDIO_LOG: voices every 2 s, plays and stops
 std::map<uint32_t, Voice> g_voices;
 float g_listener[3] = {}, g_front[3] = {0, 0, 1}, g_top[3] = {0, 1, 0};
 // Completed packets' callbacks, run as the XDK runs them: in DirectSoundDoWork on the title's thread, so they never
@@ -381,14 +383,22 @@ void Render(float* out, uint32_t frames) {
             const Voice* o = v.output ? Find(v.output) : nullptr;
             float og[2][2] = {};
             if (o) Levels(*const_cast<Voice*>(o), og);
-            LOGE("voice %08X %s tag %X ch %u rate %u freq %u vol %.2f head %.2f gain %.2f/%.2f eg %d %.2f -> %08X gain %.2f/%.2f eg %d %.2f",
-                 obj, v.stream ? "stream" : "buffer", v.tag, v.channels, v.rate, v.freq, v.volume, v.headroom, g[0][0],
+            LOGE("voice %08X %s loop %d egrel %u tag %X ch %u rate %u freq %u vol %.2f head %.2f gain %.2f/%.2f eg %d %.2f -> %08X gain %.2f/%.2f eg %d %.2f played %d playing %d",
+                 obj, v.stream ? "stream" : "buffer", int(v.looping), v.eg.release, v.tag, v.channels, v.rate, v.freq, v.volume, v.headroom, g[0][0],
                  g[0][1], int(v.eg.stage), v.eg.level, v.output, og[0][0], og[0][1], o ? int(o->eg.stage) : -1,
-                 o ? o->eg.level : 0.0f);
+                 o ? o->eg.level : 0.0f, o ? int(o->played) : -1, o ? int(o->playing) : -1);
         }
+    }
+    // mix-in buffers have no samples of their own: their envelope still runs (XACT fades and stops a sound by
+    // releasing its submix), and one that finished it stops
+    for (auto& [obj, v] : g_voices) {
+        if (v.stream || v.data || !v.playing || v.paused || !v.eg.enabled) continue;
+        for (uint32_t i = 0; i < frames && v.eg.stage != Envelope::kDone; i++) v.eg.Next();
+        if (v.eg.stage == Envelope::kDone) v.playing = false;
     }
     for (auto& [obj, v] : g_voices) {
         if (v.paused || v.sync || (!v.stream && !v.playing)) continue;
+        if (!v.stream && !v.data) continue;  // a mix-in buffer, heard through its sources
         float g[2][2];
         Levels(v, g);
         float eg_out = 1;
@@ -400,6 +410,7 @@ void Render(float* out, uint32_t frames) {
             for (int c = 0; c < 2; c++)
                 for (int k = 0; k < 2; k++) g[c][k] = og[std::min<int>(c, o->channels - 1)][k] * mine;
             eg_out = o->eg.enabled ? o->eg.level : 1.0f;
+            if (o->played && !o->playing) eg_out = 0;  // a submix stopped after it played is silent
         }
         uint32_t base = v.data + v.play_start;
         double step = double(v.freq ? v.freq : v.rate) / audio::kRate;
@@ -807,19 +818,22 @@ BUFFER(SetBufferData, 3) {
     return 0;
 }
 BUFFER(Play, 4) {
+    if (g_audio_log) LOGE("play %08X flags %X data %08X", v.obj, a[3], v.data);
     if (!v.playing || (a[3] & 2)) v.eg.Start();
-    v.playing = true;
+    v.playing = v.played = true;
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
     v.sync = a[3] & 4;
     return 0;
 }
 BUFFER(Stop, 1) {
+    if (g_audio_log) LOGE("stop %08X data %08X", v.obj, v.data);
     v.playing = false;
     return 0;
 }
 // (this, time low, time high, flags): DSBSTOPEX_ENVELOPE (1) releases, DSBSTOPEX_RELEASEWAVEFORM (2) plays to the end
 BUFFER(StopEx, 4) {
+    if (g_audio_log) LOGE("stopex %08X flags %X eg %d rel %u loop %d", v.obj, a[3], int(v.eg.enabled), v.eg.release, int(v.looping));
     if (a[3] & 2) v.looping = false;
     if ((a[3] & 1) && v.eg.enabled && v.eg.release) v.eg.Release();
     else if (!(a[3] & 2)) v.playing = false;
@@ -883,6 +897,7 @@ BUFFER(SetPitch, 2) {
 }
 // LFOs and the title's own 3D voice data are not played
 BUFFER(SetEG, 2) {
+    if (g_audio_log) LOGE("seteg %08X mode %u rel %u data %08X", v.obj, a[1] ? R32(a[1] + 4) : 0, a[1] ? R32(a[1] + 24) : 0, v.data);
     SetEnvelope(v, a[1]);
     return 0;
 }
@@ -1055,11 +1070,13 @@ STREAM(Flush, 1) {
     return 0;
 }
 STREAM(FlushEx, 4) {
+    if (g_audio_log) LOGE("stream flushex %08X flags %X active %d", v.obj, a[3], int(v.active));
     if (a[3] && !v.active) return 0;
     FlushStream(v);
     return 0;
 }
 STREAM(Pause, 2) {
+    if (g_audio_log) LOGE("stream pause %08X %u", v.obj, a[1]);
     if (a[1] == 0) v.eg.Start();  // XACT resumes a stream to start each sound
     v.paused = a[1] == 1;
     v.sync = a[1] == 2;

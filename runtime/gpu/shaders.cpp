@@ -220,11 +220,13 @@ const char* kVsEpilogue = R"(
     precise float4 p = oPos;
     p.w = magclamp(p.w);
     precise float4 q;
-    // full screen passes drawn half a pixel up-left for the console's integer pixel centers stop half a pixel short
-    // of the far edges on D3D12's, which upscaled leaves the last host columns and rows undrawn
+    // passes drawn half a pixel up-left for the console's integer pixel centers (x from -0.5 to w - 0.5) stop half a
+    // pixel short of their far edges on D3D12's: the last column and row stay undrawn, a pass over part of a target
+    // (a bloom level using 160x120 of 256x128) leaves stale pixels at its edge that the blur feeds back. Far edges
+    // on a half pixel are pulled out to the whole pixel.
     // surf.w set: a point, which stays put since pulled out it would leave the target
-    if (surf.w == 0 && abs(p.x - (surf.x - 0.5)) < 1e-3) p.x = surf.x;
-    if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;
+    if (surf.w == 0 && p.x > 0.25 && abs(frac(p.x) - 0.5) < 1e-3) p.x = round(p.x + 0.5);
+    if (surf.w == 0 && p.y > 0.25 && abs(frac(p.y) - 0.5) < 1e-3) p.y = round(p.y + 0.5);
     q.x = p.x * 2 / surf.x - 1;
     q.y = 1 - p.y * 2 / surf.y;
     q.z = p.z * surf.z;
@@ -890,8 +892,8 @@ std::string QuadHlsl(std::string s) {
         if (p != std::string::npos) s.replace(p, std::strlen(at), std::string(before) + at + after);
     };
     sub("    float fogamt : TEXCOORD4;\n", "", "    noperspective float4 e : TEXCOORD5;\n");
-    sub("    if (surf.w == 0 && abs(p.x - (surf.x - 0.5)) < 1e-3) p.x = surf.x;\n", "    o.e.xy = p.xy;\n", "");
-    sub("    if (surf.w == 0 && abs(p.y - (surf.y - 0.5)) < 1e-3) p.y = surf.y;\n", "", "    o.e.zw = p.xy;\n");
+    sub("    if (surf.w == 0 && p.x > 0.25 && abs(frac(p.x) - 0.5) < 1e-3) p.x = round(p.x + 0.5);\n", "    o.e.xy = p.xy;\n", "");
+    sub("    if (surf.w == 0 && p.y > 0.25 && abs(frac(p.y) - 0.5) < 1e-3) p.y = round(p.y + 0.5);\n", "", "    o.e.zw = p.xy;\n");
     sub("    o.pos = cp;\n", "    o.e = float4(sp, (float2(cp.x, -cp.y) / cp.w + 1) * 0.5 * surf.xy);\n", "");
     sub("float4 main(VOut i, bool front", R"(float4 unstretch(float4 t, float4 e) {
     float2 d = e.zw - e.xy, g = float2(ddx(e.x), ddy(e.y));
