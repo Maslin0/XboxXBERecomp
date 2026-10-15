@@ -585,6 +585,7 @@ private:
     };
     void CapSave(const CapImage& img, const char* name);
     void CapSave(Target& t, const char* name);
+    void CapWrite(const std::vector<uint8_t>& px, uint32_t w, uint32_t h, const char* name);  // BGRA rows as a BMP
     // a surface's place in targets_: its key, console size and entry, end when it has none
     struct TargetSlot {
         uint32_t data;
@@ -678,6 +679,7 @@ private:
     Extension* ext_ = nullptr;
     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
     FILE* cap_ = nullptr;
+    bool cap_screen_ = false;  // the next present also saves the window's image, the UI over the frame
     std::filesystem::path cap_dir_;
     uint32_t cap_i_ = 0;
     uint32_t cap_rt_ = 0;
@@ -2862,6 +2864,7 @@ void D3D12Backend::FinishCapture(const Surface& front) {
     }
     fclose(cap_);
     cap_ = nullptr;
+    cap_screen_ = true;
     cap_tex_.clear();
     LOGI("d3d12: frame captured to %s", cap_dir_.string().c_str());
 }
@@ -3044,6 +3047,15 @@ void D3D12Backend::Present(const Surface& front) {
 
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi);
+    if (cap_screen_) {
+        cap_screen_ = false;
+        // a swap chain buffer is no shader input: copied as it is, BGRA already
+        D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PRESENT;
+        Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        std::vector<uint8_t> px;
+        if (ReadBack(bb_[bi].Get(), bb_w_, bb_h_, px)) CapWrite(px, bb_w_, bb_h_, "screen");
+        Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_PRESENT);
+    }
     Submit(false);
     DeliverReports();
     bool vsync = app::Get().vsync;
@@ -3330,6 +3342,10 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
     ComPtr<ID3D12Resource> down = Shrink(img.res, *img.state, img.fmt, img.w, img.h, {.mul = img.mul});
     std::vector<uint8_t> px;
     if (!down || !ReadBack(down.Get(), img.w, img.h, px)) return;
+    CapWrite(px, img.w, img.h, name);
+}
+
+void D3D12Backend::CapWrite(const std::vector<uint8_t>& px, uint32_t w, uint32_t h, const char* name) {
     FILE* f = _wfopen((cap_dir_ / (std::string(name) + ".bmp")).c_str(), L"wb");
     if (!f) return;
     uint8_t hd[kBmpHeaderBytes] = {'B', 'M'};  // BITMAPFILEHEADER and BITMAPINFOHEADER, top down 32 bit
@@ -3337,8 +3353,8 @@ void D3D12Backend::CapSave(const CapImage& img, const char* name) {
     put(kBmpFileSize, kBmpHeaderBytes + uint32_t(px.size()));
     put(kBmpPixelOffset, kBmpHeaderBytes);
     put(kBmpInfoSize, kBmpInfoBytes);
-    put(kBmpWidth, img.w);
-    put(kBmpHeight, uint32_t(-int32_t(img.h)));
+    put(kBmpWidth, w);
+    put(kBmpHeight, uint32_t(-int32_t(h)));
     hd[kBmpPlanes] = 1;
     hd[kBmpBitCount] = 32;
     put(kBmpImageSize, uint32_t(px.size()));
