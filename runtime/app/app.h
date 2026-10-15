@@ -16,12 +16,15 @@ namespace app {
 enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
 
 struct Settings {
+    std::string monitor;             // its device name, \\.\DISPLAY2; empty the primary
     DisplayMode display_mode = DisplayMode::Borderless;
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
     uint32_t render_percent = 100;   // of the output height
     uint32_t fps_cap = 60;           // 0 unlimited
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
+    bool smaa = false;               // SMAA over the finished frame
+    bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
 };
 
@@ -35,6 +38,10 @@ struct Mode {
     uint32_t width, height;
 };
 Mode Desktop();
+// Settings::monitor's HMONITOR, the primary for empty or one not connected
+void* ChosenMonitor();
+// the game thread, at each Swap: waits while the window is in the background or minimized, the sound held
+void WaitWhileUnfocused();
 Mode Output();
 float RenderScale(uint32_t guest_height);
 // the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV

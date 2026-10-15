@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <csignal>
 #include <cwchar>
 #include <thread>
@@ -19,6 +20,7 @@
 #include <backends/imgui_impl_win32.h>
 
 #include "app/app.h"
+#include "audio/audio.h"
 #include "core/input.h"
 #include "core/log.h"
 #include "gpu/backend.h"
@@ -80,14 +82,18 @@ void DumpThreads() {
 // window thread only
 void ApplyNow() {
     const Settings& s = Get();
-    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY);
+    HMONITOR mon = static_cast<HMONITOR>(ChosenMonitor());
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(mon, &mi);
     if (g_mode_changed) {
-        ChangeDisplaySettingsExW(mi.szDevice, nullptr, nullptr, 0, nullptr);
+        // the mode goes back on the monitor that has it, the window's until now
+        MONITORINFOEXW was{};
+        was.cbSize = sizeof(was);
+        GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &was);
+        ChangeDisplaySettingsExW(was.szDevice, nullptr, nullptr, 0, nullptr);
         g_mode_changed = false;
     }
+    GetMonitorInfoW(mon, &mi);
     Mode out = Output();
     LONG_PTR visible = IsWindowVisible(g_hwnd) ? WS_VISIBLE : 0;  // a window held back for a splash or handover stays so
     DEVMODEW desktop{};
@@ -196,6 +202,21 @@ std::recursive_mutex& UiLock() {
 
 void ApplyDisplay() { PostMessageW(g_hwnd, kApplyDisplay, 0, 0); }
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
+
+void WaitWhileUnfocused() {
+    auto background = [] {
+        // XBE_NO_FOCUS_PAUSE: scripted test runs go on in the background
+        static const bool never = std::getenv("XBE_NO_FOCUS_PAUSE") != nullptr;
+        if (never || !Get().pause_on_focus_loss || !g_hwnd || !IsWindowVisible(g_hwnd)) return false;
+        return GetForegroundWindow() != g_hwnd || IsIconic(g_hwnd);
+    };
+    if (!background()) return;
+    LOGI("focus lost: paused");
+    audio::SetPaused(true);
+    while (background()) Sleep(20);
+    audio::SetPaused(false);
+    LOGI("focus back: resumed");
+}
 
 // vblanks: the console's presentation interval, each frame shown at least that many 60 Hz vertical blanks
 void Pace(uint32_t vblanks) {

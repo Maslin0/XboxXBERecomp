@@ -8,6 +8,8 @@
 #include <windows.h>
 #include <xaudio2.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -16,6 +18,12 @@
 #include "core/log.h"
 
 namespace audio {
+
+namespace {
+std::atomic<bool> g_paused{false};
+}  // namespace
+
+void SetPaused(bool paused) { g_paused = paused; }
 
 void StartOutput(std::function<void(float*, uint32_t)> render) {
     std::thread([render] {
@@ -47,7 +55,8 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
                 continue;
             }
             float* b = &bufs[(n % kSlots) * kFrames * 2];
-            render(b, kFrames);
+            if (g_paused) std::fill(b, b + kFrames * 2, 0.0f);
+            else render(b, kFrames);
             // STEAL_AUDIO_RAW=<file>: the mix as float32 stereo 48 kHz, to check sound in muted test runs
             static FILE* raw = [] {
                 const char* f = std::getenv("STEAL_AUDIO_RAW");

@@ -49,6 +49,9 @@ void Load() {
     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
+    s.smaa = t["smaa"].value_or(s.smaa);
+    s.monitor = t["monitor"].value_or(s.monitor);
+    s.pause_on_focus_loss = t["pause_on_focus_loss"].value_or(s.pause_on_focus_loss);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
@@ -68,6 +71,9 @@ toml::table Table() {
                   {"fps_cap", int64_t(s.fps_cap)},
                   {"vsync", s.vsync},
                   {"anisotropic_filtering", int64_t(s.aniso)},
+                  {"smaa", s.smaa},
+                  {"monitor", s.monitor},
+                  {"pause_on_focus_loss", s.pause_on_focus_loss},
                   {"join_ip", s.join_ip}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
@@ -93,8 +99,24 @@ void LogSettings() {
         if (!line.empty()) LOGR("  %s", line.c_str());
 }
 
+void* ChosenMonitor() {
+    struct Find {
+        std::wstring device;
+        HMONITOR found;
+    } find{std::wstring(Get().monitor.begin(), Get().monitor.end()), nullptr};
+    if (!find.device.empty())
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR mon, HDC, LPRECT, LPARAM p) -> BOOL {
+            auto* f = reinterpret_cast<Find*>(p);
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(mon, &mi) && f->device == mi.szDevice) f->found = mon;
+            return !f->found;
+        }, LPARAM(&find));
+    return find.found ? find.found : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
 Mode Desktop() {
-    HMONITOR mon = MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY);
+    HMONITOR mon = static_cast<HMONITOR>(ChosenMonitor());
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
     DEVMODEW dm{};
