@@ -25,6 +25,7 @@ struct Settings {
     uint32_t aniso = 0;              // 0 as the game asks
     bool smaa = false;               // SMAA over the finished frame
     bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
+    bool full_picture = true;        // the game's safe area (GameInfo::safe_area) fills the screen
     uint32_t language = 1;           // the console's: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
 };
@@ -98,8 +99,14 @@ struct GameInfo {
     void (*ui)(double fps);        // each frame inside the ImGui frame, UiLock held
     void (*pad)(int port, input::Pad& pad);  // a polled pad before the game gets it
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
+    // where the title draws inside its back buffer, left for a TV's overscan around it: x, y, width, height, then
+    // the back buffer's width and height; all 0 when it draws the whole buffer
+    uint32_t safe_area[6] = {};
 };
 extern const GameInfo kGame;
+
+// the part of a frame_w x frame_h front buffer shown on the screen, as u, v, width, height
+void ShownRect(uint32_t frame_w, uint32_t frame_h, float uv[4]);
 
 // sleeps out the rest of the frame for the fps cap
 void Pace(uint32_t vblanks = 0);

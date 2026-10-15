@@ -53,6 +53,7 @@ void Load() {
     s.monitor = t["monitor"].value_or(s.monitor);
     s.pause_on_focus_loss = t["pause_on_focus_loss"].value_or(s.pause_on_focus_loss);
     s.language = t["language"].value_or(s.language);
+    s.full_picture = t["full_picture"].value_or(s.full_picture);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
@@ -76,6 +77,7 @@ toml::table Table() {
                   {"monitor", s.monitor},
                   {"pause_on_focus_loss", s.pause_on_focus_loss},
                   {"language", int64_t(s.language)},
+                  {"full_picture", s.full_picture},
                   {"join_ip", s.join_ip}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
@@ -145,6 +147,17 @@ bool Widescreen() {
         wide = m.width * 2 >= m.height * 3;  // 3:2 or wider
     }
     return wide;
+}
+
+void ShownRect(uint32_t frame_w, uint32_t frame_h, float uv[4]) {
+    const uint32_t* a = kGame.safe_area;
+    uv[0] = uv[1] = 0;
+    uv[2] = uv[3] = 1;
+    if (!Get().full_picture || !a[2] || !a[3] || frame_w != a[4] || frame_h != a[5]) return;
+    uv[0] = float(a[0]) / frame_w;
+    uv[1] = float(a[1]) / frame_h;
+    uv[2] = float(a[2]) / frame_w;
+    uv[3] = float(a[3]) / frame_h;
 }
 
 float RenderScale(uint32_t guest_height) {

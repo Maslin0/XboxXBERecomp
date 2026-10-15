@@ -625,7 +625,7 @@ private:
     void ResizeSwap();
     void UploadGammaRamp();
     void DrawFrame(Target* t, uint32_t bi);
-    void BlitFrame(ID3D12Resource* src, DXGI_FORMAT fmt);
+    void BlitFrame(ID3D12Resource* src, DXGI_FORMAT fmt, const float uv[4]);
     // SMAA over the frame, src readable: its blend, readable, or null when it can't run; then its steps
     ID3D12Resource* Smaa(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h);
     bool EnsureSmaaLookups();
@@ -2981,7 +2981,7 @@ void D3D12Backend::UploadGammaRamp() {
     cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
 }
 
-void D3D12Backend::BlitFrame(ID3D12Resource* src, DXGI_FORMAT fmt) {
+void D3D12Backend::BlitFrame(ID3D12Resource* src, DXGI_FORMAT fmt, const float uv[4]) {
     // 16:9 when the console reports a widescreen display, else 4:3
     bool wide = app::Widescreen();
     float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
@@ -2989,7 +2989,6 @@ void D3D12Backend::BlitFrame(ID3D12Resource* src, DXGI_FORMAT fmt) {
     float h = float(bb_h_);
     float vw = std::min(w, h * aspect);
     float vh = vw / aspect;
-    float uv[4] = {0, 0, 1, 1};
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
@@ -3120,7 +3119,11 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
     cl_->ClearRenderTargetView(rh, black, 0, nullptr);
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
-    if (shown) BlitFrame(shown, shown_fmt);
+    if (shown) {
+        float uv[4];
+        app::ShownRect(t->gw, t->gh, uv);  // the title's safe area, its overscan border left off
+        BlitFrame(shown, shown_fmt, uv);
+    }
     RenderUi();
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
 }
