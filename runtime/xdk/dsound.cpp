@@ -204,6 +204,9 @@ struct Voice {
     bool playing = false, looping = false, paused = false;
     bool sync = false;  // held until IDirectSound_SynchPlayback
     bool active = false, ending = false;  // stream: took a packet since it went quiet, quiet again once they run out
+    // stream: flushed with DSSTREAMFLUSHEX_ASYNC, it stays stopped and flushes what comes in until it is paused or
+    // resumed, as XACT does before it reuses the stream (XACT keeps submitting while it waits for the flush)
+    bool stopped = false;
     double pos = 0;  // frames
     uint32_t freq = 0;
     // stream
@@ -1072,6 +1075,10 @@ STREAM(Process, 3) {
     Packet pk{R32(in), R32(in + 4), R32(in + 8), R32(in + 12), R32(in + 16)};
     if (pk.completed_ptr) W32(pk.completed_ptr, 0);
     if (pk.status_ptr) W32(pk.status_ptr, kPacketPending);
+    if (v.stopped) {
+        Complete(v, pk, kFlushed);
+        return 0;
+    }
     v.packets.push_back(pk);
     v.active = true;
     v.ending = false;
@@ -1088,7 +1095,14 @@ STREAM(Flush, 1) {
 }
 STREAM(FlushEx, 4) {
     if (g_audio_log) LOGE("stream flushex %08X flags %X active %d", v.obj, a[3], int(v.active));
-    if (a[3] && !v.active) return 0;
+    constexpr uint32_t kAsync = 1;
+    if (a[3] & kAsync) {
+        // a stream nothing plays from (held paused for a cut scene) never drains: flushed now. Before, XACT
+        // waited ~28 s for it ahead of a mission.
+        FlushStream(v);
+        v.stopped = true;
+        return 0;
+    }
     FlushStream(v);
     return 0;
 }
@@ -1097,6 +1111,7 @@ STREAM(Pause, 2) {
     if (a[1] == 0) v.eg.Start();  // XACT resumes a stream to start each sound
     v.paused = a[1] == 1;
     v.sync = a[1] == 2;
+    v.stopped = false;
     return 0;
 }
 STREAM(SetVolume, 2) {

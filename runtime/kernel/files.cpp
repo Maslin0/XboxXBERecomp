@@ -499,7 +499,23 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
 }
 
-KERNEL_EXPORT(219, NtReadFile, 8) { return Transfer(a, false, 0); }
+// STEAL_IO_STACK=<name part>: the guest stack of each read of a file whose name has it
+KERNEL_EXPORT(219, NtReadFile, 8) {
+    if (const char* want = std::getenv("STEAL_IO_STACK")) {
+        auto f = FileFromHandle(a[0]);
+        if (f && f->host.filename().string().find(want) != std::string::npos) {
+            char st[1024];
+            int k = 0;
+            for (uint32_t i = 0; i < 96 && k < 900; i++) {
+                uint32_t v = R32(ctx.esp + i * 4);
+                if (v >= 0x11000 && v < 0x1C0000) k += snprintf(st + k, sizeof(st) - k, " %X:%05X", i * 4, v);
+            }
+            st[k] = 0;
+            LOGE("io: read stack%s", st);
+        }
+    }
+    return Transfer(a, false, 0);
+}
 KERNEL_EXPORT(236, NtWriteFile, 8) { return Transfer(a, true, 0); }
 // the buffer argument is an array of one page per element
 KERNEL_EXPORT(220, NtReadFileScatter, 8) {
