@@ -499,6 +499,14 @@ private:
     ID3D12Resource* BindTexture(const State& s, int stage, DrawTextures& stages);
     ID3D12Resource* BindTargetTexture(const State& s, int stage, const TextureDesc& d, Target& t, bool box,
                                       DrawTextures& stages);
+    // a depth buffer read through a colour format: its bytes as the console stores them, z24 << 8 | stencil
+    ID3D12Resource* DepthAsColour(Target& t, int stage, DrawTextures& stages);
+    struct DepthColour {
+        ComPtr<ID3D12Resource> res;
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        uint32_t w = 0, h = 0;
+    };
+    std::unordered_map<uint32_t, DepthColour> depth_colour_;
     ID3D12Resource* BindGuestTexture(const State& s, int stage, const TextureDesc& d, const FormatInfo& fi,
                                      DrawTextures& stages);
     bool CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t key);
@@ -660,6 +668,10 @@ private:
     uint32_t smp_used_ = 0;
     std::unordered_map<uint64_t, Target> targets_;
     std::unordered_map<uint32_t, uint64_t> target_used_;  // target address to the frame it was last used
+    // small colour targets drawn this frame, and every target ever sampled: one drawn and never sampled is read by
+    // the CPU without a lock (auto exposure), so it goes back to guest memory a frame late at each present
+    std::unordered_set<uint32_t> small_drawn_, sampled_;
+    void WriteBackSmall();
     std::unordered_map<uint64_t, Tex> textures_;  // by data address, a P8 texture's with its palette's above
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
     Extension* ext_ = nullptr;
@@ -1115,6 +1127,7 @@ bool D3D12Backend::BindTargets(const State& s) {
         if (LatchCpuWrite(*rt)) UploadTarget(*rt, s.rt);
         Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
         rt->drawn = true;
+        if (rt->gw * rt->gh <= 64 * 64) small_drawn_.insert(rt->data);
     }
     if (ds) {
         Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -1569,6 +1582,7 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     TexInfo& info = stages.info[stage];
     D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[stage];
     if (&t == draw_ds_) return nullptr;
+    sampled_.insert(t.data);
     bool feedback = &t == draw_rt_;
     stages.rt[stage] = true;
     if (!t.depth && LatchCpuWrite(t)) {
@@ -1592,6 +1606,50 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
     if (t.depth) info.shadow = ShadowDepthKind(d.format);
     info.kind = kTex2D;
     return t.res.Get();
+}
+
+const char* kDepthAsColourHlsl = R"(
+Texture2D<float> depth : register(t0);
+struct O { float4 p : SV_Position; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+// A8R8G8B8 over D24S8: a = z bits 16-23, r = 8-15, g = 0-7, b = stencil
+float4 psmain(O i) : SV_Target {
+    uint z = (uint)round(saturate(depth.Load(int3(i.p.xy, 0))) * 16777215.0);
+    return float4(((z >> 8) & 255) / 255.0, (z & 255) / 255.0, 0, (z >> 16) / 255.0);
+}
+)";
+
+ID3D12Resource* D3D12Backend::DepthAsColour(Target& t, int stage, DrawTextures& stages) {
+    DepthColour& c = depth_colour_[t.data];
+    if (!c.res || c.w != t.w || c.h != t.h) {
+        if (c.res) CurrentFrame().garbage.push_back(c.res);
+        c = DepthColour{};
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC td = Texture2DDesc(kBgra, t.w, t.h);
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, c.state, nullptr, IID_PPV_ARGS(&c.res))))
+            return nullptr;
+        c.w = t.w;
+        c.h = t.h;
+    }
+    if (free_rtv_.empty()) return nullptr;
+    Transition(c.res.Get(), c.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), free_rtv_.back(), rtv_inc_);
+    dev_->CreateRenderTargetView(c.res.Get(), nullptr, rh);
+    ID3D12Resource* src[3] = {t.res.Get(), nullptr, nullptr};
+    const DXGI_FORMAT fmt[3] = {DXGI_FORMAT_R24_UNORM_X8_TYPELESS, kBgra, kBgra};
+    const float p[8] = {};
+    Pass(kDepthAsColourHlsl, "psmain", kBgra, rh, t.w, t.h, src, fmt, p, -1);
+    Transition(c.res.Get(), c.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    stages.info[stage].kind = kTex2D;
+    stages.sv[stage].Format = kBgra;
+    return c.res.Get();
 }
 
 bool SameTexture(const Tex& tx, const TextureDesc& d) {
@@ -1777,6 +1835,11 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     auto tit = targets_.find(SizedTargetKey(d.data, fi.depth, d.width, d.height) | alt);
     if (tit != targets_.end() && !d.cube && d.depth == 1 && !fi.compressed) {
         return BindTargetTexture(s, stage, d, tit->second, box, stages);
+    }
+    // only a depth buffer there: a 32 bit colour texture over it reads the depth bytes (depth of field)
+    if (tit == targets_.end() && !fi.depth && !fi.compressed && !d.cube && d.depth == 1) {
+        auto dit = targets_.find(SizedTargetKey(d.data, true, d.width, d.height));
+        if (dit != targets_.end() && &dit->second != draw_ds_) return DepthAsColour(dit->second, stage, stages);
     }
     return BindGuestTexture(s, stage, d, fi, stages);
 }
@@ -2964,6 +3027,7 @@ void D3D12Backend::Present(const Surface& front) {
     } else if (g_capture.exchange(false) && CaptureOn()) {
         StartCapture();
     }
+    WriteBackSmall();
     ResizeSwap();
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
@@ -3140,6 +3204,17 @@ void D3D12Backend::RecordLateCopy(Late& l, uint32_t slot, ID3D12Resource* src) {
     l.fence[slot] = fence_value_ + 1;  // the next Submit carries it
     l.frame[slot] = presents_;
     l.next = (slot + 1) % kFrames;
+}
+
+void D3D12Backend::WriteBackSmall() {
+    static const bool off = std::getenv("STEAL_NO_WB") != nullptr;
+    if (off) small_drawn_.clear();
+    for (uint32_t data : small_drawn_) {
+        if (sampled_.count(data)) continue;
+        DeliverLate(data);
+        RecordLate(data);
+    }
+    small_drawn_.clear();
 }
 
 void D3D12Backend::RecordLate(uint32_t data) {

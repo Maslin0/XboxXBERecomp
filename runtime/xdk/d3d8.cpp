@@ -98,6 +98,8 @@ struct RawVertex {
     std::array<uint32_t, 16> headers{};       // vertex buffer headers the streams point at
 };
 RawVertex g_raw;
+void PushStat(uint32_t m);
+gpu::State RawDrawState();
 std::unique_ptr<gpu::Backend> g_backend;
 std::recursive_mutex g_lock;
 
@@ -188,6 +190,8 @@ uint32_t NewSurface(uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
 void SyncDeferred() {
     // deferred states live in the title's memory, the inline SetRenderState and SetTextureStageState write them
     for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++) g_state.rs[i] = R32(kRenderState + i * 4);
+    // titles that write the library's table themselves change the texture modes past SetRenderState
+    g_state.rs[gpu::kRsPsTextureModes] = R32(kRenderState + gpu::kRsPsTextureModes * 4);
     for (int s = 0; s < 4; s++)
         for (uint32_t i = 0; i < gpu::kTssBumpEnvMat00; i++) g_state.tss[s][i] = R32(kTextureState + (s * kStageStates + i) * 4);
 }
@@ -613,7 +617,11 @@ HLE_STDCALL(D3DDevice_SetRenderStateNotInline, 2) {
         SetComplex(rs, a[0]);                         \
         return 0;                                     \
     }
-COMPLEX_STATE(PSTextureModes, gpu::kRsPsTextureModes)
+HLE_STDCALL(D3DDevice_SetRenderState_PSTextureModes, 1) {
+    if (std::getenv("STEAL_LOG_MODES")) LOGE("modes: SetRenderState %05X from %08X", a[0], R32(ctx.esp));
+    SetComplex(gpu::kRsPsTextureModes, a[0]);
+    return 0;
+}
 COMPLEX_STATE(VertexBlend, gpu::kRsVertexBlend)
 COMPLEX_STATE(FogColor, gpu::kRsFogColor)
 COMPLEX_STATE(FillMode, gpu::kRsFillMode)
@@ -944,6 +952,7 @@ HLE_STDCALL(D3DDevice_SetPixelShader, 1) {
     put(gpu::kMPsCombinerCount, d[53]);
     put(gpu::kMPsDotMapping, d[55]);
     put(gpu::kMPsInputTexture, d[56]);
+    if (std::getenv("STEAL_LOG_MODES")) LOGE("modes: SetPixelShader %08X def %05X from %08X", a[0], d[54], R32(ctx.esp));
     SetComplex(gpu::kRsPsTextureModes, d[54]);
     return 0;
 }
@@ -959,19 +968,21 @@ HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
 // drawing
 
 HLE_STDCALL(D3DDevice_DrawVertices, 3) {
+    PushStat(0xD0000001u);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));  // a visibility test begun since the last draw counts this one
     SyncDeferred();
-    if (g_backend) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
+    if (g_backend) g_backend->Draw(g_raw.arrays ? RawDrawState() : g_state, a[0], a[1], a[2], nullptr);
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
+    PushStat(0xD0000002u);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
     SyncDeferred();
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
-    if (g_backend) g_backend->Draw(g_state, a[0], 0, a[1], indices);
+    if (g_backend) g_backend->Draw(g_raw.arrays ? RawDrawState() : g_state, a[0], 0, a[1], indices);
     return 0;
 }
 
@@ -1115,6 +1126,10 @@ bool ApplyRawMethod(uint32_t m, uint32_t v) {
     } else if (m == kConstantLoad) {
         g_raw.const_load = v;
         g_raw.const_word = 0;
+    } else if (m == 0x030C && !std::getenv("STEAL_NO_ZMAP")) {  // SET_DEPTH_TEST_ENABLE, what SetRenderState_ZEnable pushes
+        g_state.rs[gpu::kRsZEnable] = v;
+    } else if (m == 0x032C && !std::getenv("STEAL_NO_ZMAP")) {  // SET_STENCIL_TEST_ENABLE
+        g_state.rs[gpu::kRsStencilEnable] = v;
     } else {
         return false;
     }
@@ -1243,6 +1258,7 @@ void Walk(uint32_t end) {
 }  // namespace d3d
 
 HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
+    PushStat(0xD0000003u);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
     DrawUp(a[0], a[1], HostPtr(a[2]), a[3]);
@@ -1276,6 +1292,7 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
             if (m == kInlineArray) {
                 if (prim) vertices.push_back(v);
             } else if (m != kBeginEnd) {
+                PushStat(0x10000 | m);
                 if (m >> 2 < g_state.simple.size()) g_state.simple[m >> 2] = v;
             } else if (v) {
                 prim = v;
@@ -1316,6 +1333,7 @@ HLE_STDCALL(D3DDevice_GetVisibilityTestResult, 3) {
 // ARRAY_ELEMENT32 (one index, an odd count's last), drawn here as DrawIndexedVertices would. Inline vertices and
 // other methods go the way EndPush takes them.
 HLE_STDCALL(D3DDevice_RunPushBuffer, 2) {
+    PushStat(0xD0000004u);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     constexpr uint32_t kBeginEnd = 0x17FC, kElement16 = 0x1800, kElement32 = 0x1808, kInlineArray = 0x1818;
     static std::vector<uint16_t> indices;
@@ -1384,6 +1402,7 @@ HLE_STDCALL(D3DDevice_Begin, 1) {
 }
 // the library's End pushes the end of the primitive, here it is drawn
 HLE_STDCALL(D3DDevice_End, 0) {
+    PushStat(0xD0000005u);
     XDK_REQUIRE("d3d", XDK_KEY(CDevice_Flags));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
