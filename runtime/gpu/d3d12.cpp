@@ -2599,6 +2599,9 @@ void D3D12Backend::DeliverReports() {
         const Report& r = reports_.front();
         double pixels = 0;
         for (const Query& q : r.queries) pixels += double(query_counts_[q.index]) / q.samples_per_pixel;
+        // STEAL_REPORT_LOG: each visibility test's count
+        static const bool report_log = std::getenv("STEAL_REPORT_LOG") != nullptr;
+        if (report_log) LOGE("report %08X: %zu draws, %.0f pixels", r.va, r.queries.size(), pixels);
         kernel::W32(r.va + kTime, uint32_t(presents_));
         kernel::W32(r.va + kTimeHigh, 0);
         kernel::W32(r.va + kCount, uint32_t(std::lround(pixels)));

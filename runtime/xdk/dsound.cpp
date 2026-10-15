@@ -194,6 +194,7 @@ struct Voice {
     uint32_t obj = 0;
     bool stream = false;
     int refs = 1;
+    bool released = false;  // the title let go of it: it goes once no voice plays through it
     // format
     uint16_t tag = 1, channels = 1, bits = 16, align = 2;
     uint32_t rate = 48000;
@@ -785,39 +786,52 @@ void WriteVoiceProperties(const Voice& v, uint32_t out) {
 HLE_STDCALL(DirectSoundCreateBuffer, 2) { return NewBuffer(a[0], a[1]); }
 HLE_STDCALL(IDirectSound_CreateSoundBuffer, 4) { return NewBuffer(a[1], a[2]); }
 
+// STEAL_AUDIO_TRACE: a buffer's life (made, played, routed, stopped, released), not its per frame levels
+static bool BufferTrace(const char* name) {
+    static const bool on = std::getenv("STEAL_AUDIO_TRACE") != nullptr;
+    if (!on) return false;
+    for (const char* busy : {"SetPitch", "SetVolume", "GetVoiceProperties", "GetStatus", "SetMixBins", "SetMixBinVolumes",
+                             "SetPosition", "SetFrequency", "GetCurrentPosition"})
+        if (std::strcmp(name, busy) == 0) return false;
+    return true;
+}
+
 #define BUFFER(name, nargs)                                 \
     static uint32_t buf_##name(Voice& v, const Args& a);    \
     HLE_STDCALL(IDirectSoundBuffer_##name, nargs) {         \
         std::lock_guard<std::recursive_mutex> lock(g_lock); \
         Voice* v = Find(a[0]);                              \
+        if (BufferTrace(#name)) LOGE("ds %s %08X %08X %08X", #name, a[0], a[1], nargs > 2 ? a[2] : 0u); \
         return v ? buf_##name(*v, a) : 0x80004005u;         \
     }                                                       \
     static uint32_t buf_##name([[maybe_unused]] Voice& v, [[maybe_unused]] const Args& a)
 
-// a buffer's last reference gone: it goes, and lets go of the mix-in buffer it played through
-static void DropBuffer(uint32_t obj) {
+// A released buffer goes once no voice plays through it, then the mix-in buffer it played through may go too.
+// XACT releases a submix while its sounds still play through it, as the console's references allow: a source
+// that lost its submix would sound at full volume on its own bins (the "truck" drone), and its freed address,
+// taken by the next buffer, would route other sounds into a stranger.
+static void Collect(uint32_t obj) {
     Voice* v = Find(obj);
-    if (!v || --v->refs > 0) return;
+    if (!v || !v->released) return;
+    for (auto& [other, w] : g_voices)
+        if (w.output == obj) return;
     if (v->owned) mem::FreeContiguous(v->owned);
     uint32_t out = v->output;
-    for (auto& [other, w] : g_voices)
-        if (w.output == obj) w.output = 0;
     g_voices.erase(obj);
     mem::FreeSystem(obj);
-    if (out) DropBuffer(out);
+    if (out) Collect(out);
 }
-// SetOutputBuffer holds a reference on the mix-in buffer, as the console's does: XACT releases a submix while its
-// sounds still play through it, and a source that lost it would sound at full volume on its own bins
 static void SetOutput(Voice& v, uint32_t out) {
     if (out == v.output) return;
-    if (Voice* o = out ? Find(out) : nullptr) o->refs++;
+    if (out && !Find(out)) LOG_FIRST(8, "dsound: %08X output to %08X, not a buffer", v.obj, out);
     uint32_t old = v.output;
     v.output = out;
-    if (old) DropBuffer(old);
+    if (old) Collect(old);
 }
 BUFFER(Release, 1) {
-    if (v.refs > 1) return uint32_t(--v.refs);
-    DropBuffer(v.obj);
+    if (--v.refs > 0) return uint32_t(v.refs);
+    v.released = true;
+    Collect(v.obj);
     return 0;
 }
 BUFFER(Unlock, 5) { return 0; }
@@ -1054,7 +1068,7 @@ STREAM(Release, 1) {
     uint32_t obj = v.obj, out = v.output;
     g_voices.erase(obj);
     mem::FreeSystem(obj);
-    if (out) DropBuffer(out);
+    if (out) Collect(out);
     return 0;
 }
 STREAM(GetInfo, 2) {
