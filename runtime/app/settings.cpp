@@ -52,6 +52,7 @@ void Load() {
     s.smaa = t["smaa"].value_or(s.smaa);
     s.monitor = t["monitor"].value_or(s.monitor);
     s.pause_on_focus_loss = t["pause_on_focus_loss"].value_or(s.pause_on_focus_loss);
+    s.language = t["language"].value_or(s.language);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
@@ -74,6 +75,7 @@ toml::table Table() {
                   {"smaa", s.smaa},
                   {"monitor", s.monitor},
                   {"pause_on_focus_loss", s.pause_on_focus_loss},
+                  {"language", int64_t(s.language)},
                   {"join_ip", s.join_ip}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
