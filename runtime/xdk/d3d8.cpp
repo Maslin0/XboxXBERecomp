@@ -471,14 +471,15 @@ uint8_t Clamp255(int v) { return uint8_t(std::clamp(v, 0, 255)); }
 
 // (surface, source RECT, destination RECT, colour key on, colour key): YUY2 to BGRA on the CPU, then presented
 HLE_STDCALL(D3DDevice_UpdateOverlay, 5) {
-    std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t surf = a[0];
     if (!surf || !g_backend) return 0;
+    app::SplashFirstFrame();  // a movie before the first Swap: the game window opens for it, not behind the splash
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t size = R32(surf + 16), sw = (size & 0xFFF) + 1, sh = (size >> 12 & 0xFFF) + 1;
     uint32_t spitch = ((size >> 24 & 0xFF) + 1) * 64;
     const uint8_t* src = static_cast<const uint8_t*>(HostPtr(mem::VirtualFromPhysical(R32(surf + 4))));
     uint32_t back = R32(g_buffers[0] + 16), w = (back & 0xFFF) + 1, h = (back >> 12 & 0xFFF) + 1;
-    if (!g_overlay) g_overlay = NewSurface(w, h, 0x1E, 4);  // LIN_X8R8G8B8
+    if (!g_overlay) g_overlay = NewSurface(w, h, (R32(g_buffers[0] + 12) >> 8) & 0xFF, 4);  // the back buffers' format
     uint32_t pitch = ((R32(g_overlay + 16) >> 24 & 0xFF) + 1) * 64;
     uint8_t* dst = static_cast<uint8_t*>(HostPtr(mem::VirtualFromPhysical(R32(g_overlay + 4))));
     auto rect = [](uint32_t r, int32_t def_w, int32_t def_h, int32_t out[4]) {
@@ -513,6 +514,7 @@ HLE_STDCALL(D3DDevice_UpdateOverlay, 5) {
                      Clamp255((c + 516 * u) >> 8);
         }
     }
+    gpu::MarkDirty(g_overlay);  // written here, not through a lock: the target takes the new pixels
     g_backend->Present(SurfaceOf(g_overlay));
     return 0;
 }
