@@ -2565,14 +2565,14 @@ void D3D12Backend::EndDrawCapture(const State& s, const Assembled& a, uint32_t c
 
 // each shader once, as translated
 void D3D12Backend::CaptureShader(const char* kind, uint64_t key, const std::string& src) {
-    if (!cap_sh_.insert(key).second) return;
     char name[48];
     snprintf(name, sizeof(name), "%s_%016llX.hlsl", kind, (unsigned long long)key);
+    fprintf(cap_, "     %s\n", name);  // every draw names its shaders; each is written once
+    if (!cap_sh_.insert(key).second) return;
     if (FILE* f = _wfopen((cap_dir_ / name).c_str(), L"w")) {
         fwrite(src.data(), 1, src.size(), f);
         fclose(f);
     }
-    fprintf(cap_, "     %s\n", name);
 }
 
 void D3D12Backend::CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk) {
@@ -3837,7 +3837,9 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
 // the frame moves to another target: save the one it leaves
 void D3D12Backend::CapStep(const Surface& rt) {
     uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
-    if (d == cap_rt_) return;
+    // XBE_CAPTURE_EACH: the target after every draw, not only when the title moves to another (heavy)
+    static const bool each = std::getenv("XBE_CAPTURE_EACH") != nullptr;
+    if (d == cap_rt_ && !each) return;
     auto it = targets_.find(TargetMapKey(cap_rt_, false));
     if (cap_rt_ && it != targets_.end()) {
         char name[32];

@@ -1069,6 +1069,13 @@ HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t reg = a[0], src = a[1], n = a[2];
     for (uint32_t i = 0; i < n && reg + i < 16; i++) std::memcpy(g_state.psc[reg + i].data(), HostPtr(src + i * 16), 16);
+    static const bool psc_log = std::getenv("XBE_PSC_LOG") != nullptr;
+    if (psc_log) {
+        const auto& c = g_state.psc[reg & 15];
+        LOGE("psc reg %u n %u (%.3f %.3f %.3f %.3f) ps %08X map %08X %08X %08X", reg, n, c[0], c[1], c[2], c[3],
+             g_state.ps ? g_state.ps->handle : 0, g_state.ps ? g_state.ps->def[57] : 0,
+             g_state.ps ? g_state.ps->def[58] : 0, g_state.ps ? g_state.ps->def[59] : 0);
+    }
     gpu::ApplyPixelConstants(g_state, reg, n);
     return 0;
 }
