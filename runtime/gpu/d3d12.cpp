@@ -2363,6 +2363,29 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
         for (uint32_t k = 0; k < n * 4; k++) fprintf(cap_, " %g", a.vertices[v * n * 4 + k]);
         fprintf(cap_, " ]");
     }
+    // the raw path: each float input register of the first vertices as the title wrote it
+    if (a.vertices.empty() && !a.index_src) {
+        for (int r = 0; r < 16; r++) {
+            const VertexElement& e = a.elements[size_t(r)];
+            if (!(a.regs >> r & 1)) continue;
+            uint32_t floats = e.format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 4
+                              : e.format == DXGI_FORMAT_R32G32B32_FLOAT  ? 3
+                              : e.format == DXGI_FORMAT_R32G32_FLOAT     ? 2
+                              : e.format == DXGI_FORMAT_R32_FLOAT        ? 1
+                                                                         : 0;
+            const VertexBuffer& vb = a.buffers[e.buffer];
+            if (!floats || !vb.src || !vb.stride) continue;
+            fprintf(cap_, "\n     v%d", r);
+            for (uint32_t v = 0; v < std::min<uint32_t>(a.vertex_count, 8); v++) {
+                if (uint64_t(v) * vb.stride + e.offset + floats * 4 > vb.bytes) break;
+                float f[4];
+                std::memcpy(f, vb.src + size_t(v) * vb.stride + e.offset, floats * 4);
+                fprintf(cap_, " [");
+                for (uint32_t k = 0; k < floats; k++) fprintf(cap_, " %g", f[k]);
+                fprintf(cap_, " ]");
+            }
+        }
+    }
     for (int r = 0; r < kVsConstants; r++) {
         const auto& v = s.vsc[r];
         if (v[0] || v[1] || v[2] || v[3]) {
@@ -2611,6 +2634,47 @@ void D3D12Backend::DeliverReports() {
     }
 }
 
+// STEAL_GEOM_LOG: a small raw draw with an input beyond a million or not finite, its inputs and position constants
+void LogWildVertices(const State& s, const Assembled& a, uint32_t prim) {
+    static const bool geom_log = std::getenv("STEAL_GEOM_LOG") != nullptr;
+    constexpr uint32_t kSmall = 64;
+    constexpr float kWild = 1e6f;
+    if (!geom_log || !a.vertices.empty() || a.index_src || !a.vertex_count || a.vertex_count > kSmall) return;
+    std::string line;
+    bool wild = false;
+    char buf[64];
+    for (int r = 0; r < 16; r++) {
+        const VertexElement& e = a.elements[size_t(r)];
+        uint32_t floats = e.format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 4
+                          : e.format == DXGI_FORMAT_R32G32B32_FLOAT  ? 3
+                          : e.format == DXGI_FORMAT_R32G32_FLOAT     ? 2
+                                                                     : 0;
+        const VertexBuffer& vb = a.buffers[e.buffer];
+        if (!(a.regs >> r & 1) || !floats || !vb.src || !vb.stride) continue;
+        snprintf(buf, sizeof(buf), " v%d", r);
+        line += buf;
+        for (uint32_t v = 0; v < a.vertex_count; v++) {
+            if (uint64_t(v) * vb.stride + e.offset + floats * 4 > vb.bytes) break;
+            float f[4];
+            std::memcpy(f, vb.src + size_t(v) * vb.stride + e.offset, floats * 4);
+            line += " [";
+            for (uint32_t k = 0; k < floats; k++) {
+                wild |= !(std::fabs(f[k]) < kWild);
+                snprintf(buf, sizeof(buf), " %g", f[k]);
+                line += buf;
+            }
+            line += " ]";
+        }
+    }
+    if (!wild) return;
+    LOGE("wild vertices: rt %08X prim %u count %u vs %08X tex %08X%s", s.rt.data, prim, a.vertex_count, s.vs_handle,
+         s.textures[0], line.c_str());
+    for (int r : {49, 58, 59, 60}) {
+        const auto& v = s.vsc[r];
+        LOGE("  c%d %g %g %g %g", r, v[0], v[1], v[2], v[3]);
+    }
+}
+
 void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     PerfScope perf_draw{g_perf.draw};
     g_perf.draws++;
@@ -2620,6 +2684,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (ext_) ext_->BeginDraw(s);
     Assembled& a = asm_;
     if (!AssembleDraw(s, prim, start, count, indices, a)) return;
+    LogWildVertices(s, a, prim);
     // past the ring every upload is a buffer of its own: seconds lost on a frame that draws a whole level once
     if (CurrentFrame().used > kUploadSize - kUploadReserve) Submit(true);
     if (!BindTargets(s)) return;
