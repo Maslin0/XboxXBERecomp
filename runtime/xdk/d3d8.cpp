@@ -622,6 +622,9 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     // D3DPRESENT_INTERVAL_TWO) keeps its speed; IMMEDIATE (bit 31) and DEFAULT (0) wait one vblank at most
     uint32_t interval = R32(kRenderState + gpu::kRsPresentationInterval * 4);
     if (!interval) interval = g_interval;
+    // XBE_FORCE_INTERVAL=<vblanks>: paced to that many vblanks whatever the title asks (tests)
+    static const char* forced = std::getenv("XBE_FORCE_INTERVAL");
+    if (forced) interval = uint32_t(std::atoi(forced));
     LOG_FIRST(8, "d3d: presentation interval %X", interval);
     app::Pace(interval & 0x80000000u ? 0 : std::clamp<uint32_t>(interval & 0xF, 1, 4));
     // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
