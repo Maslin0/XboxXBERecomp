@@ -112,6 +112,7 @@ uint32_t g_interval = 0;  // D3DPRESENT_PARAMETERS presentation interval
 void PushStat(uint32_t m);
 gpu::State RawDrawState();
 gpu::State SelectedProgramState();
+bool DirectHandle(uint32_t h);
 gpu::State DrawState();
 std::unique_ptr<gpu::Backend> g_backend;
 std::recursive_mutex g_lock;
@@ -981,6 +982,18 @@ HLE_STDCALL(D3DDevice_SelectVertexShader, 2) {
     static std::unordered_set<uint64_t> seen;
     if (log && seen.insert(uint64_t(a[0]) << 32 | a[1]).second)
         LOGE("select vertex shader %08X at %u from %05X, arrays %d", a[0], a[1], R32(ctx.esp), int(g_raw.arrays));
+    if (log && DirectHandle(a[0])) {
+        static std::unordered_set<std::string> tables;
+        std::string t;
+        char buf[48];
+        for (uint32_t r = 0; r < 16; r++) {
+            uint32_t at = (a[0] & ~1u) + 0x14 + r * 16;
+            if ((R32(at + 8) & 0xFF) == 0x02) continue;
+            snprintf(buf, sizeof(buf), " v%u s%u +%u t%X", r, R32(at), R32(at + 4), R32(at + 8));
+            t += buf;
+        }
+        if (tables.insert(t).second) LOGE("select direct attributes:%s", t.c_str());
+    }
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetShaderConstantMode, 1) {
@@ -1346,10 +1359,25 @@ bool ApplyRawMethod(uint32_t m, uint32_t v) {
 // the program in the title's program memory (SelectVertexShader or a pushed start), over the API's streams laid out by
 // the declaration of the handle last selected or set: what the library sends when the streams were set after the
 // title's own arrays
+// SelectVertexShaderDirect(attributes, slot) copies 16 attributes into a vertex shader of the library's own and
+// selects that: per register its stream, offset in the vertex and D3DVSDT type, 16 bytes each
+constexpr uint32_t kDirectAttributes = 0x14, kAttributeBytes = 16, kTypeNone = 0x02;
+bool DirectHandle(uint32_t h) { return (h & 1) && !g_vs.count(h); }
+void DirectInputs(uint32_t h, gpu::VertexShader& vs) {
+    for (uint32_t r = 0; r < 16; r++) {
+        uint32_t a = (h & ~1u) + kDirectAttributes + r * kAttributeBytes;
+        uint32_t stream = R32(a), offset = R32(a + 4), type = R32(a + 8) & 0xFF;
+        vs.inputs[r] = {};
+        if (type != kTypeNone && stream < 16) vs.inputs[r] = {int(stream), offset, type};
+    }
+    for (uint32_t n = 0; n < 16; n++) vs.stream_stride[n] = g_state.streams[n].stride;
+}
+
 gpu::State SelectedProgramState() {
     gpu::State s = g_state;
     auto it = g_vs.find(g_raw.selected);
-    if (it == g_vs.end()) return s;
+    bool direct = DirectHandle(g_raw.selected);
+    if (it == g_vs.end() && !direct) return s;
     std::vector<uint32_t> program;
     for (uint32_t i = g_raw.start; i < 136; i++) {
         program.insert(program.end(), &g_raw.program[i * 4], &g_raw.program[i * 4 + 4]);
@@ -1359,11 +1387,17 @@ gpu::State SelectedProgramState() {
     auto mix = [&](uint32_t w) { h = (h ^ w) * 1099511628211ull; };
     for (uint32_t w : program) mix(w);
     mix(g_raw.selected);
+    gpu::VertexShader layout;
+    if (direct) {
+        DirectInputs(g_raw.selected, layout);
+        for (uint32_t r = 0; r < 16; r++) mix(layout.inputs[r].stream), mix(layout.inputs[r].offset), mix(layout.inputs[r].type);
+        for (uint32_t n = 0; n < 16; n++) mix(layout.stream_stride[n]);
+    }
     // the render thread tells shaders apart by pointer: one object per program and declaration
     static std::unordered_map<uint64_t, std::shared_ptr<gpu::VertexShader>> made;
     auto& vs = made[h];
     if (!vs) {
-        vs = std::make_shared<gpu::VertexShader>(*it->second);
+        vs = std::make_shared<gpu::VertexShader>(direct ? layout : *it->second);
         vs->handle = 1;
         vs->program = program;
         vs->program_type = 0x2078;
@@ -1377,7 +1411,7 @@ gpu::State SelectedProgramState() {
 // an API draw's vertex state: the title's own arrays and program, its program over the API's streams, or the API's
 gpu::State DrawState() {
     if (g_raw.arrays) return RawDrawState();
-    if (g_raw.own_program && g_vs.count(g_raw.selected)) return SelectedProgramState();
+    if (g_raw.own_program && (g_vs.count(g_raw.selected) || DirectHandle(g_raw.selected))) return SelectedProgramState();
     return g_state;
 }
 
