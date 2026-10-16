@@ -395,6 +395,25 @@ void Render(float* out, uint32_t frames) {
                  o ? o->eg.level : 0.0f, o ? int(o->played) : -1, o ? int(o->playing) : -1, bins.empty() ? " front" : bins.c_str());
         }
     }
+    // STEAL_AUDIO_COUNT: how many voices hold on every 2 s (buffers, mix-in buffers, streams; looping, releasing)
+    static const bool count_voices = std::getenv("STEAL_AUDIO_COUNT") != nullptr;
+    static uint32_t counted = 0;
+    if (count_voices && (counted += frames) >= audio::kRate * 2) {
+        counted = 0;
+        int buffers = 0, mixins = 0, streams = 0, looping = 0, releasing = 0, total = int(g_voices.size());
+        for (auto& [obj, v] : g_voices) {
+            if (v.stream) {
+                streams += !v.packets.empty();
+                continue;
+            }
+            if (!v.playing) continue;
+            (v.data ? buffers : mixins)++;
+            looping += v.looping;
+            releasing += v.eg.stage == Envelope::kRelease;
+        }
+        LOGE("voices: %d buffers %d mix-in %d streams, %d looping %d releasing, %d objects", buffers, mixins, streams,
+             looping, releasing, total);
+    }
     // mix-in buffers have no samples of their own: their envelope still runs (XACT fades and stops a sound by
     // releasing its submix), and one that finished it stops
     for (auto& [obj, v] : g_voices) {
