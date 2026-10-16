@@ -103,7 +103,8 @@ struct RawVertex {
     uint32_t const_load = 0, const_word = 0;  // SET_TRANSFORM_CONSTANT_LOAD, hardware register order
     std::array<uint32_t, 16> offset{}, format{};  // SET_VERTEX_DATA_ARRAY_OFFSET, _FORMAT
     bool arrays = false;                      // the title has pointed the arrays itself
-    uint32_t selected = 0;                    // SelectVertexShader's handle: its declaration lays out the streams
+    uint32_t selected = 0;                    // the last handle selected or set: its declaration lays out the streams
+    bool own_program = false;                 // the program runs from the title's program memory (selected or pushed)
     std::array<uint32_t, 16> headers{};       // vertex buffer headers the streams point at
 };
 RawVertex g_raw;
@@ -922,7 +923,8 @@ HLE_STDCALL(D3DDevice_GetVertexShaderFunction, 3) {
 HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     UseApiVertexState();
-    g_raw.selected = 0;
+    g_raw.selected = a[0];
+    g_raw.own_program = false;
     uint32_t h = a[0];
     g_state.vs_handle = h;
     g_state.vs = nullptr;
@@ -974,6 +976,7 @@ HLE_STDCALL(D3DDevice_SelectVertexShader, 2) {
     Walk(Dev(kDevPush));
     g_raw.start = a[1];
     g_raw.selected = a[0];
+    g_raw.own_program = true;
     static const bool log = std::getenv("STEAL_GEOM_LOG") != nullptr;
     static std::unordered_set<uint64_t> seen;
     if (log && seen.insert(uint64_t(a[0]) << 32 | a[1]).second)
@@ -1061,6 +1064,50 @@ HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
 
 // STEAL_GEOM_LOG: a small quad list (the lens flare): where its vertices come from, the draw's range, the arrays'
 // formats and offsets and the first vertices' words, a few a second
+// STEAL_GEOM_LOG: a small quad list drawn over the API's streams: the selected handle and program slot, the vertex
+// shader, the streams and the selected declaration, the first vertices' words of stream 0, a few a second
+static void LogApiQuads(uint32_t prim, uint32_t start, uint32_t count) {
+    static const bool geom_log = std::getenv("STEAL_GEOM_LOG") != nullptr;
+    constexpr uint32_t kQuads = 8, kSmall = 64, kShown = 6, kWords = 10, kPerSecond = 6;
+    if (!geom_log || g_raw.arrays || prim != kQuads || count > kSmall) return;
+    static auto second = std::chrono::steady_clock::now();
+    static uint32_t logged = 0;
+    auto now = std::chrono::steady_clock::now();
+    if (now - second >= std::chrono::seconds(1)) second = now, logged = 0;
+    if (++logged > kPerSecond) return;
+    std::string line;
+    char buf[80];
+    for (uint32_t n = 0; n < 4; n++) {
+        uint32_t vb = g_state.streams[n].vb;
+        snprintf(buf, sizeof(buf), " s%u %08X/%u data %08X", n, vb, g_state.streams[n].stride, vb ? R32(vb + 4) : 0);
+        line += buf;
+    }
+    auto it = g_vs.find(g_raw.selected);
+    if (it != g_vs.end())
+        for (uint32_t r = 0; r < 16; r++) {
+            const auto& in = it->second->inputs[r];
+            if (in.stream < 0) continue;
+            snprintf(buf, sizeof(buf), " v%u s%d +%u t%X", r, in.stream, in.offset, in.type);
+            line += buf;
+        }
+    LOGE("api quads: start %u count %u vs %08X selected %08X own program %d at %u%s", start, count, g_state.vs_handle,
+         g_raw.selected, int(g_raw.own_program), g_raw.start, line.c_str());
+    uint32_t vb = g_state.streams[0].vb, stride = g_state.streams[0].stride;
+    if (!vb || !stride) return;
+    uint32_t data = mem::VirtualFromPhysical(R32(vb + 4));
+    for (uint32_t v = 0; v < kShown && v < count; v++) {
+        line.clear();
+        for (uint32_t w = 0; w < stride / 4 && w < kWords; w++) {
+            uint32_t x = R32(data + (start + v) * stride + w * 4);
+            float f;
+            std::memcpy(&f, &x, 4);
+            snprintf(buf, sizeof(buf), " %g", f);
+            line += buf;
+        }
+        LOGE("  vertex %u:%s", start + v, line.c_str());
+    }
+}
+
 static void LogQuadSource(const char* call, uint32_t prim, uint32_t start, uint32_t count, uint32_t data,
                           uint32_t stride) {
     static const bool geom_log = std::getenv("STEAL_GEOM_LOG") != nullptr;
@@ -1105,6 +1152,7 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     if (g_raw.arrays)
         LogQuadSource("arrays", a[0], a[1], a[2], mem::VirtualFromPhysical(g_raw.offset[0] & 0x7FFFFFFF),
                       g_raw.format[0] >> 8);
+    LogApiQuads(a[0], a[1], a[2]);
     if (g_backend) g_backend->Draw(DrawState(), a[0], a[1], a[2], nullptr);
     return 0;
 }
@@ -1277,6 +1325,7 @@ bool ApplyRawMethod(uint32_t m, uint32_t v) {
         g_raw.load_word = 0;
     } else if (m == kProgramStart) {
         g_raw.start = v;
+        g_raw.own_program = true;
     } else if (m == kConstantLoad) {
         g_raw.const_load = v;
         g_raw.const_word = 0;
@@ -1294,8 +1343,9 @@ bool ApplyRawMethod(uint32_t m, uint32_t v) {
 
 // the state a draw of the title's own arrays sees: the program from the start slot to its last instruction, each
 // enabled array a stream of its own read from register r
-// the program selected from the title's program memory with SelectVertexShader, over the API's streams laid out by
-// the selected handle's declaration: what the library sends when the streams were set after the title's own arrays
+// the program in the title's program memory (SelectVertexShader or a pushed start), over the API's streams laid out by
+// the declaration of the handle last selected or set: what the library sends when the streams were set after the
+// title's own arrays
 gpu::State SelectedProgramState() {
     gpu::State s = g_state;
     auto it = g_vs.find(g_raw.selected);
@@ -1327,7 +1377,7 @@ gpu::State SelectedProgramState() {
 // an API draw's vertex state: the title's own arrays and program, its program over the API's streams, or the API's
 gpu::State DrawState() {
     if (g_raw.arrays) return RawDrawState();
-    if (g_raw.selected) return SelectedProgramState();
+    if (g_raw.own_program && g_vs.count(g_raw.selected)) return SelectedProgramState();
     return g_state;
 }
 
