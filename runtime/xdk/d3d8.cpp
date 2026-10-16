@@ -1041,11 +1041,52 @@ HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
 
 // drawing
 
+// STEAL_GEOM_LOG: a small quad list (the lens flare): where its vertices come from, the draw's range, the arrays'
+// formats and offsets and the first vertices' words, a few a second
+static void LogQuadSource(const char* call, uint32_t prim, uint32_t start, uint32_t count, uint32_t data,
+                          uint32_t stride) {
+    static const bool geom_log = std::getenv("STEAL_GEOM_LOG") != nullptr;
+    constexpr uint32_t kQuads = 8, kSmall = 64, kShown = 12, kWords = 12, kPerSecond = 6;
+    constexpr uint32_t kFloat3 = 0x32;  // D3DVSDT_FLOAT3: the flare's positions; the HUD's are FLOAT2
+    if (!geom_log || prim != kQuads || count > kSmall) return;
+    uint32_t type = g_raw.arrays ? g_raw.format[0] & 0xFF : g_state.vs ? g_state.vs->inputs[0].type & 0xFF : 0;
+    if (type != kFloat3) return;
+    static auto second = std::chrono::steady_clock::now();
+    static uint32_t logged = 0;
+    auto now = std::chrono::steady_clock::now();
+    if (now - second >= std::chrono::seconds(1)) second = now, logged = 0;
+    if (++logged > kPerSecond) return;
+    std::string line;
+    char buf[64];
+    for (uint32_t r = 0; r < 16 && g_raw.arrays; r++) {
+        if (!((g_raw.format[r] >> 4) & 0xF)) continue;
+        snprintf(buf, sizeof(buf), " v%u fmt %X off %08X", r, g_raw.format[r], g_raw.offset[r]);
+        line += buf;
+    }
+    LOGE("%s quads: start %u count %u raw %d data %08X stride %u%s", call, start, count, int(g_raw.arrays), data,
+         stride, line.c_str());
+    if (!data || !stride) return;
+    for (uint32_t v = 0; v < kShown && v < count; v++) {
+        line.clear();
+        for (uint32_t w = 0; w < stride / 4 && w < kWords; w++) {
+            uint32_t x = R32(data + (start + v) * stride + w * 4);
+            float f;
+            std::memcpy(&f, &x, 4);
+            snprintf(buf, sizeof(buf), " %g", f);
+            line += buf;
+        }
+        LOGE("  vertex %u:%s", start + v, line.c_str());
+    }
+}
+
 HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     PushStat(0xD0000001u);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));  // a visibility test begun since the last draw counts this one
     SyncDeferred();
+    if (g_raw.arrays)
+        LogQuadSource("arrays", a[0], a[1], a[2], mem::VirtualFromPhysical(g_raw.offset[0] & 0x7FFFFFFF),
+                      g_raw.format[0] >> 8);
     if (g_backend) g_backend->Draw(g_raw.arrays ? RawDrawState() : g_state, a[0], a[1], a[2], nullptr);
     return 0;
 }
@@ -1114,6 +1155,7 @@ namespace {
 uint32_t g_im_prim = 0, g_im_mask = 0;  // open primitive, slots it wrote
 float g_im_attr[64];                    // 16 slots of x y z w
 std::vector<float> g_im_vertices;       // every slot per vertex
+std::vector<uint32_t> g_im_methods;     // STEAL_GEOM_LOG: the open primitive's methods and values
 
 // visibility tests: depth passing pixels are counted while enabled, a report gets the count since the clear,
 // at a physical address in the first 16 MB
@@ -1136,6 +1178,26 @@ void EndPrimitive() {
     uint32_t prim = g_im_prim, count = uint32_t(g_im_vertices.size() / 64), handle = g_state.vs_handle;
     g_im_prim = 0;
     if (!prim || !count) return;
+    // STEAL_GEOM_LOG: a quad list's methods as the title pushed them, a few a second
+    static const bool geom_log = std::getenv("STEAL_GEOM_LOG") != nullptr;
+    constexpr uint32_t kQuads = 8, kPerSecond = 4, kShownMethods = 96;
+    if (geom_log && prim == kQuads) {
+        static auto second = std::chrono::steady_clock::now();
+        static uint32_t logged = 0;
+        auto now = std::chrono::steady_clock::now();
+        if (now - second >= std::chrono::seconds(1)) second = now, logged = 0;
+        if (++logged <= kPerSecond) {
+            std::string line;
+            char buf[40];
+            for (size_t i = 0; i + 1 < g_im_methods.size() && i < kShownMethods * 2; i += 2) {
+                float f;
+                std::memcpy(&f, &g_im_methods[i + 1], 4);
+                snprintf(buf, sizeof(buf), " %X=%g", g_im_methods[i], f);
+                line += buf;
+            }
+            LOGE("immediate quads: %u vertices mask %X:%s", count, g_im_mask, line.c_str());
+        }
+    }
     if (!(handle & 1) && (handle & 0xE) == 4) LOG_FIRST(1, "d3d: pretransformed immediate mode vertices are not supported");
     auto bound = g_state.vs, from = handle & 1 ? bound : nullptr;
     Made& m = made[{from.get(), g_im_mask}];
@@ -1295,6 +1357,7 @@ void Walk(uint32_t end) {
                     g_im_prim = v;
                     g_im_mask = 0;
                     g_im_vertices.clear();
+                    g_im_methods.clear();
                 } else {
                     EndPrimitive();
                 }
@@ -1324,6 +1387,8 @@ void Walk(uint32_t end) {
                 continue;
             }
             if (!g_im_prim) continue;
+            g_im_methods.push_back(m);
+            g_im_methods.push_back(v);
             g_im_mask |= 1u << (a - g_im_attr) / 4;
             if (a == g_im_attr && last) g_im_vertices.insert(g_im_vertices.end(), g_im_attr, g_im_attr + 64);
         }
@@ -1337,6 +1402,7 @@ HLE_STDCALL(D3DDevice_DrawVerticesUP, 4) {
     PushStat(0xD0000003u);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
+    LogQuadSource("up", a[0], 0, a[1], a[2], a[3]);
     DrawUp(a[0], a[1], HostPtr(a[2]), a[3]);
     return 0;
 }
