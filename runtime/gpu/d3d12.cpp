@@ -2635,12 +2635,12 @@ void D3D12Backend::DeliverReports() {
 }
 
 // STEAL_GEOM_LOG: a small raw draw with a position (v0) beyond a million or not finite, or a quad list (sprites) with
-// a float4 corner more than kFar times its nonzero w out (far off the screen): its inputs and position constants
+// a float4 corner more than kFar times its nonzero w out (a sprite past the screen): its inputs and position constants
 void LogWildVertices(const State& s, const Assembled& a, uint32_t prim, const uint8_t* indices) {
     static const bool geom_log = std::getenv("STEAL_GEOM_LOG") != nullptr;
     constexpr uint32_t kSmall = 64;
     constexpr float kWild = 1e6f;
-    constexpr float kFar = 8.0f;
+    constexpr float kFar = 2.0f;
     constexpr uint32_t kQuads = 8;  // D3DPT_QUADLIST
     if (!geom_log || !a.vertices.empty() || indices || !a.vertex_count || a.vertex_count > kSmall) return;
     std::string line;
@@ -2661,7 +2661,8 @@ void LogWildVertices(const State& s, const Assembled& a, uint32_t prim, const ui
             float f[4];
             std::memcpy(f, vb.src + size_t(v) * vb.stride + e.offset, floats * 4);
             line += " [";
-            if (prim == kQuads && (s.vs_handle & 1) && floats == 4 && r == 0 && f[3] != 0)
+            bool sane = std::fabs(f[2]) < kWild && std::fabs(f[3]) < kWild && f[3] != 0;  // not a shorter input read long
+            if (prim == kQuads && (s.vs_handle & 1) && floats == 4 && r == 0 && sane)
                 wild |= !(std::fabs(f[0]) <= kFar * std::fabs(f[3]) && std::fabs(f[1]) <= kFar * std::fabs(f[3]));
             for (uint32_t k = 0; k < floats; k++) {
                 if (r == 0) wild |= !(std::fabs(f[k]) < kWild);
@@ -2671,9 +2672,14 @@ void LogWildVertices(const State& s, const Assembled& a, uint32_t prim, const ui
             line += " ]";
         }
     }
+    // at most kPerSecond a second: the moment it goes wrong is late in a mission
+    constexpr int kPerSecond = 12;
+    static auto second = std::chrono::steady_clock::now();
     static int logged = 0;
-    constexpr int kMaxLogged = 3000;
-    if (!wild || ++logged > kMaxLogged) return;
+    if (!wild) return;
+    auto now = std::chrono::steady_clock::now();
+    if (now - second >= std::chrono::seconds(1)) second = now, logged = 0;
+    if (++logged > kPerSecond) return;
     LOGE("wild vertices: rt %08X prim %u count %u vs %08X tex %08X%s", s.rt.data, prim, a.vertex_count, s.vs_handle,
          s.textures[0], line.c_str());
     for (int r : {49, 58, 59, 60}) {
