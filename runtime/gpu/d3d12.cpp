@@ -2673,16 +2673,19 @@ void LogWildVertices(const State& s, const Assembled& a, uint32_t prim, const ui
             line += " ]";
         }
     }
-    // at most kPerSecond a second: the moment it goes wrong is late in a mission
+    // at most kPerSecond a second: the moment it goes wrong is late in a mission. Visibility test draws (the sun's
+    // for the lens flare) go too, kCountedPerSecond a second.
     constexpr int kPerSecond = 12;
+    constexpr int kCountedPerSecond = 4;
+    bool counted = s.simple[kMCountEnable >> 2];
     static auto second = std::chrono::steady_clock::now();
-    static int logged = 0;
-    if (!wild) return;
+    static int logged = 0, logged_counted = 0;
+    if (!wild && !counted) return;
     auto now = std::chrono::steady_clock::now();
-    if (now - second >= std::chrono::seconds(1)) second = now, logged = 0;
-    if (++logged > kPerSecond) return;
-    LOGE("wild vertices: rt %08X prim %u count %u vs %08X tex %08X%s", s.rt.data, prim, a.vertex_count, s.vs_handle,
-         s.textures[0], line.c_str());
+    if (now - second >= std::chrono::seconds(1)) second = now, logged = logged_counted = 0;
+    if (wild ? ++logged > kPerSecond : ++logged_counted > kCountedPerSecond) return;
+    LOGE("%s: rt %08X prim %u count %u vs %08X tex %08X%s", wild ? "wild vertices" : "counted draw", s.rt.data, prim,
+         a.vertex_count, s.vs_handle, s.textures[0], line.c_str());
     for (int r : {49, 58, 59, 60}) {
         const auto& v = s.vsc[r];
         LOGE("  c%d %g %g %g %g", r, v[0], v[1], v[2], v[3]);
