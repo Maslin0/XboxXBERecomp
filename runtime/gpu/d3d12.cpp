@@ -2544,9 +2544,9 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
 void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
                                const DrawTextures& stages) {
     fprintf(cap_,
-            "%04u draw rt %08X ds %08X prim %u count %u vs %08X ps %08X blend %u %X %X zen %u %X zwrite %u "
+            "%04u draw rt %08X/%X ds %08X prim %u count %u vs %08X ps %08X blend %u %X %X zen %u %X zwrite %u "
             "zbias %d %.2f cull %u cw %X c0 %.3f %.3f %.3f %.3f",
-            cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
+            cap_i_++, s.rt.data, s.rt.format, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
             k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
             c.pc[0][2], c.pc[0][3]);
     CaptureTextures(s, stages);
@@ -2554,7 +2554,12 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
 
 // small draws: their inputs and constants; then ends the draw's line
 void D3D12Backend::EndDrawCapture(const State& s, const Assembled& a, uint32_t count, const DrawConstants& c) {
-    if (count <= kQuadVertices) CaptureInputs(s, a, c);
+    if (count <= kQuadVertices) {
+        CaptureInputs(s, a, c);
+    } else {  // a mesh: its combiner constants (a material's glow sits in them)
+        fprintf(cap_, "\n     pc");
+        for (int r = 0; r < 8; r++) fprintf(cap_, " (%.3f %.3f %.3f %.3f)", c.pc[r][0], c.pc[r][1], c.pc[r][2], c.pc[r][3]);
+    }
     fputc('\n', cap_);
 }
 
