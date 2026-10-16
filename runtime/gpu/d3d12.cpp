@@ -3321,6 +3321,14 @@ void LogPerf() {
 
 void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
+    // XBE_CAPTURE_EVERY=<seconds>: a capture that often, as F3 asks for one
+    static const char* every_env = std::getenv("XBE_CAPTURE_EVERY");
+    static const double every = every_env ? std::atof(every_env) : 0;
+    static auto last_auto = std::chrono::steady_clock::now();
+    if (every > 0 && std::chrono::steady_clock::now() - last_auto >= std::chrono::duration<double>(every)) {
+        last_auto = std::chrono::steady_clock::now();
+        g_capture = true;
+    }
     if (cap_) {
         FinishCapture(front);
     } else if (g_capture.exchange(false) && CaptureOn()) {

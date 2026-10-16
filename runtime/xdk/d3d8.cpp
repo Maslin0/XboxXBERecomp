@@ -827,8 +827,16 @@ HLE_FASTCALL(D3DDevice_SwitchTexture, 1) {
     return 0;
 }
 
+// the API's streams and shader replace what the title pushed itself (the library sends them at the next draw):
+// the commands pushed so far are read first, a later push of arrays takes over again
+static void UseApiVertexState() {
+    Walk(Dev(kDevPush));
+    g_raw.arrays = false;
+}
+
 HLE_STDCALL(D3DDevice_SetStreamSource, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    UseApiVertexState();
     uint32_t n = a[0] & 15, vb = a[1], stride = a[2];
     uint32_t old = R32(kStreams + n * kStreamSize + XDK_Stream_Buffer);
     AddRef(ctx, vb);
@@ -910,6 +918,7 @@ HLE_STDCALL(D3DDevice_GetVertexShaderFunction, 3) {
 
 HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    UseApiVertexState();
     uint32_t h = a[0];
     g_state.vs_handle = h;
     g_state.vs = nullptr;
