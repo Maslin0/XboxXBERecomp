@@ -2661,11 +2661,12 @@ void LogWildVertices(const State& s, const Assembled& a, uint32_t prim, const ui
             float f[4];
             std::memcpy(f, vb.src + size_t(v) * vb.stride + e.offset, floats * 4);
             line += " [";
-            bool sane = std::fabs(f[2]) < kWild && std::fabs(f[3]) < kWild && f[3] != 0;  // not a shorter input read long
-            if (prim == kQuads && (s.vs_handle & 1) && floats == 4 && r == 0 && sane)
-                wild |= !(std::fabs(f[0]) <= kFar * std::fabs(f[3]) && std::fabs(f[1]) <= kFar * std::fabs(f[3]));
+            float w = floats == 4 ? f[3] : 1.0f;  // a shorter input reads w as 1
+            if (prim == kQuads && (s.vs_handle & 1) && r == 0 && w != 0)
+                wild |= !(std::fabs(f[0]) <= kFar * std::fabs(w) && std::fabs(f[1]) <= kFar * std::fabs(w));
             for (uint32_t k = 0; k < floats; k++) {
-                if (r == 0) wild |= !(std::fabs(f[k]) < kWild);
+                // XYZRHW sprites carry other data where z and rhw go
+                if (r == 0 && (k < 2 || !a.pretransformed)) wild |= !(std::fabs(f[k]) < kWild);
                 snprintf(buf, sizeof(buf), " %g", f[k]);
                 line += buf;
             }
