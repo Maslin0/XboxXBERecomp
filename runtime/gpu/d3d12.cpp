@@ -2642,7 +2642,36 @@ void LogWildVertices(const State& s, const Assembled& a, uint32_t prim, const ui
     constexpr float kWild = 1e6f;
     constexpr float kFar = 2.0f;
     constexpr uint32_t kQuads = 8;  // D3DPT_QUADLIST
-    if (!geom_log || !a.vertices.empty() || indices || !a.vertex_count || a.vertex_count > kSmall) return;
+    constexpr uint32_t kCountedShown = 8;  // a visibility test's first vertices
+    bool counted = s.simple[kMCountEnable >> 2];
+    if (!geom_log || !a.vertex_count) return;
+    if (counted && !a.vertices.empty()) {
+        // fixed function: each vertex's position through world, view and projection, as clip x y w and on screen
+        static auto second = std::chrono::steady_clock::now();
+        static int logged = 0;
+        constexpr int kConvertedPerSecond = 4;
+        auto now = std::chrono::steady_clock::now();
+        if (now - second >= std::chrono::seconds(1)) second = now, logged = 0;
+        if (++logged > kConvertedPerSecond) return;
+        float wv[16], wvp[16];
+        MatMul(s.transforms[kTsWorld].data(), s.transforms[kTsView].data(), wv);
+        MatMul(wv, s.transforms[kTsProjection].data(), wvp);
+        uint32_t n = 0;
+        for (int r = 0; r < 16; r++) n += (a.regs >> r) & 1;
+        std::string line;
+        char buf[96];
+        for (uint32_t v = 0; v < std::min(a.vertex_count, kCountedShown) && n; v++) {
+            const float* p = &a.vertices[size_t(v) * n * 4];
+            float c[4];
+            for (int j = 0; j < 4; j++) c[j] = p[0] * wvp[j] + p[1] * wvp[4 + j] + p[2] * wvp[8 + j] + wvp[12 + j];
+            snprintf(buf, sizeof(buf), " [%g %g %g | clip %g %g w %g]", p[0], p[1], p[2], c[0], c[1], c[3]);
+            line += buf;
+        }
+        LOGE("counted draw: rt %08X prim %u count %u vp %u,%u %ux%u%s", s.rt.data, prim, a.vertex_count, s.viewport.x,
+             s.viewport.y, s.viewport.w, s.viewport.h, line.c_str());
+        return;
+    }
+    if (!a.vertices.empty() || (!counted && (indices || a.vertex_count > kSmall))) return;
     std::string line;
     bool wild = false;
     char buf[64];
@@ -2656,7 +2685,7 @@ void LogWildVertices(const State& s, const Assembled& a, uint32_t prim, const ui
         if (!(a.regs >> r & 1) || !floats || !vb.src || !vb.stride) continue;
         snprintf(buf, sizeof(buf), " v%d", r);
         line += buf;
-        for (uint32_t v = 0; v < a.vertex_count; v++) {
+        for (uint32_t v = 0; v < (counted ? std::min(a.vertex_count, kCountedShown) : a.vertex_count); v++) {
             if (uint64_t(v) * vb.stride + e.offset + floats * 4 > vb.bytes) break;
             float f[4];
             std::memcpy(f, vb.src + size_t(v) * vb.stride + e.offset, floats * 4);
@@ -2677,7 +2706,6 @@ void LogWildVertices(const State& s, const Assembled& a, uint32_t prim, const ui
     // for the lens flare) go too, kCountedPerSecond a second.
     constexpr int kPerSecond = 12;
     constexpr int kCountedPerSecond = 4;
-    bool counted = s.simple[kMCountEnable >> 2];
     static auto second = std::chrono::steady_clock::now();
     static int logged = 0, logged_counted = 0;
     if (!wild && !counted) return;
