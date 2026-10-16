@@ -53,6 +53,7 @@ void Load() {
     s.monitor = t["monitor"].value_or(s.monitor);
     s.pause_on_focus_loss = t["pause_on_focus_loss"].value_or(s.pause_on_focus_loss);
     s.keyboard = t["keyboard"].value_or(s.keyboard);
+    s.lod_bias = float(t["lod_bias"].value_or(double(s.lod_bias)));
     s.language = t["language"].value_or(s.language);
     s.full_picture = t["full_picture"].value_or(s.full_picture);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
@@ -78,6 +79,7 @@ toml::table Table() {
                   {"monitor", s.monitor},
                   {"pause_on_focus_loss", s.pause_on_focus_loss},
                   {"keyboard", s.keyboard},
+                  {"lod_bias", double(s.lod_bias)},
                   {"language", int64_t(s.language)},
                   {"full_picture", s.full_picture},
                   {"join_ip", s.join_ip}};

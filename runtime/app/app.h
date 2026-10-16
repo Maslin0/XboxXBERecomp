@@ -23,6 +23,7 @@ struct Settings {
     uint32_t fps_cap = 60;           // 0 unlimited
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
+    float lod_bias = 0;              // added to mipmapped textures' level of detail: below 0 sharper far away
     bool smaa = false;               // SMAA over the finished frame
     bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
     bool keyboard = true;            // the keyboard works controller 1 while the window has the focus

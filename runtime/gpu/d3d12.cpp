@@ -2091,6 +2091,7 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     sd.AddressV = Address(clamp && t[kTssAddressV] == kTaddressWrap ? kTaddressClamp : t[kTssAddressV]);
     sd.AddressW = Address(t[kTssAddressW]);
     sd.MipLODBias = Bits(t[kTssMipLodBias]);
+    if (mip && stages.sv[i].Texture2D.MipLevels > 1 && !stages.info[i].shadow) sd.MipLODBias += app::Get().lod_bias;
     sd.MinLOD = float(t[kTssMaxMipLevel]);
     sd.MaxLOD = mip ? D3D12_FLOAT32_MAX : sd.MinLOD;
     Color(t[kTssBorderColor], sd.BorderColor);
