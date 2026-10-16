@@ -3423,6 +3423,27 @@ void D3D12Backend::Present(const Surface& front) {
         if (ReadBack(bb_[bi].Get(), bb_w_, bb_h_, px)) CapWrite(px, bb_w_, bb_h_, "screen");
         Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_PRESENT);
     }
+    // XBE_SCREEN_BURST=<seconds>,<frames>: the window's image of that many presents from then on (XBE_CAPTURE_DIR\burst),
+    // for the UI's animations
+    static const char* burst_env = std::getenv("XBE_SCREEN_BURST");
+    static int burst_left = burst_env && std::strchr(burst_env, ',') ? std::atoi(std::strchr(burst_env, ',') + 1) : 0;
+    static const auto burst_at = std::chrono::steady_clock::now() +
+                                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                     std::chrono::duration<double>(burst_env ? std::atof(burst_env) : 0));
+    if (burst_left > 0 && !cap_ && CaptureOn() && std::chrono::steady_clock::now() >= burst_at) {
+        static int n = 0;
+        cap_dir_ = app::ExeDir() / diag::CaptureDir() / "burst";
+        std::error_code ec;
+        std::filesystem::create_directories(cap_dir_, ec);
+        D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PRESENT;
+        Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        std::vector<uint8_t> px;
+        char name[16];
+        snprintf(name, sizeof(name), "%04d", n++);
+        if (ReadBack(bb_[bi].Get(), bb_w_, bb_h_, px)) CapWrite(px, bb_w_, bb_h_, name);
+        Transition(bb_[bi].Get(), st, D3D12_RESOURCE_STATE_PRESENT);
+        burst_left--;
+    }
     Submit(false);
     DeliverReports();
     bool vsync = app::Get().vsync;
