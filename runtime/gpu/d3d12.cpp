@@ -197,13 +197,15 @@ float4 smaa_blend(SmaaBlendV i) : SV_Target { return SMAANeighborhoodBlendingPS(
 )";
 
 const char* kDepthHlsl = R"(
+cbuffer B : register(b1) { float4 uvrect; };
 Texture2D<float> img : register(t0);
 SamplerState ps : register(s1);
 struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
     O o;
-    o.uv = float2((id << 1) & 2, id & 2);
-    o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = uvrect.xy + t * uvrect.zw;
     return o;
 }
 float psmain(O i) : SV_Depth { return img.SampleLevel(ps, i.uv, 0); }
@@ -549,9 +551,9 @@ private:
               float blend) override;
     ID3D12PipelineState* EnsurePassPipeline(const char* hlsl, const char* entry, DXGI_FORMAT rtv, float blend);
     // Draw, in call order, each callee right after its caller
-    bool DepthCopy(const State& s);
+    bool DepthCopy(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices);
     ID3D12PipelineState* EnsureDepthCopyPipeline();
-    void DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* pso);
+    void DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* pso, const float rect[4], const float uv[4]);
     bool AssembleDraw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
                       Assembled& a);
     bool BindTargets(const State& s);
@@ -1246,13 +1248,23 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline() {
 }
 
 // src's depth drawn into dst's depth buffer
-void D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* pso) {
-    if (cap_) fprintf(cap_, "%04u depth copy %08X to %08X\n", cap_i_++, src.data, dst.data);
+// rect: where in dst, in its guest pixels (x, y, w, h); uv: the part of src (x, y, w, h)
+void D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* pso, const float rect[4],
+                                 const float uv[4]) {
+    if (cap_) {
+        fprintf(cap_, "%04u depth copy %08X to %08X rect %g %g %g %g uv %g %g %g %g\n", cap_i_++, src.data, dst.data,
+                rect[0], rect[1], rect[2], rect[3], uv[0], uv[1], uv[2], uv[3]);
+    }
     Transition(src.res.Get(), src.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(dst.res.Get(), dst.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     D3D12_CPU_DESCRIPTOR_HANDLE dh = Cpu(dsv_heap_.Get(), dst.view, dsv_inc_);
     cl_->OMSetRenderTargets(0, nullptr, FALSE, &dh);
-    SetFullViewport(dst.w, dst.h);
+    float sx = float(dst.w) / float(dst.gw), sy = float(dst.h) / float(dst.gh);
+    D3D12_VIEWPORT vp{rect[0] * sx, rect[1] * sy, rect[2] * sx, rect[3] * sy, 0, 1};
+    D3D12_RECT scissor{LONG(vp.TopLeftX), LONG(vp.TopLeftY), LONG(std::ceil(vp.TopLeftX + vp.Width)),
+                       LONG(std::ceil(vp.TopLeftY + vp.Height))};
+    cl_->RSSetViewports(1, &vp);
+    cl_->RSSetScissorRects(1, &scissor);
     uint32_t slot = AllocSrvSlots(1);
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
@@ -1261,13 +1273,46 @@ void D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* 
     sv.Texture2D.MipLevels = 1;
     dev_->CreateShaderResourceView(src.res.Get(), &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
     Alloc cb = Upload(256, 256);
+    std::memcpy(cb.cpu, uv, 4 * sizeof(float));
     DrawFullScreen(pso, cb.gpu, slot);
     dst.drawn = true;
     bound_rt_ = bound_ds_ = nullptr;
 }
 
-// a depth buffer drawn as colour into another depth buffer's memory: copied as depth
-bool D3D12Backend::DepthCopy(const State& s) {
+// a draw's corner: its screen position (register 0) and first texture coordinate (register 9), when it has both as
+// floats in either of Assemble's layouts
+static bool Corner(const Assembled& a, uint32_t v, float pos[2], float tc[2]) {
+    constexpr int kPosition = 0, kTexcoord = 9;
+    if (!(a.regs >> kPosition & 1) || !(a.regs >> kTexcoord & 1)) return false;
+    auto read = [&](int r, float* out) {
+        if (!a.vertices.empty()) {
+            uint32_t n = 0, at = 0;
+            for (int k = 0; k < 16; k++) {
+                if (!(a.regs >> k & 1)) continue;
+                if (k == r) at = n;
+                n++;
+            }
+            size_t i = (size_t(v) * n + at) * 4;
+            if (i + 2 > a.vertices.size()) return false;
+            out[0] = a.vertices[i];
+            out[1] = a.vertices[i + 1];
+            return true;
+        }
+        const VertexElement& e = a.elements[size_t(r)];
+        const VertexBuffer& vb = a.buffers[e.buffer];
+        bool floats = e.format == DXGI_FORMAT_R32G32B32A32_FLOAT || e.format == DXGI_FORMAT_R32G32B32_FLOAT ||
+                      e.format == DXGI_FORMAT_R32G32_FLOAT;
+        if (!floats || !vb.src || uint64_t(v) * vb.stride + e.offset + 8 > vb.bytes) return false;
+        std::memcpy(out, vb.src + size_t(v) * vb.stride + e.offset, 8);
+        return true;
+    };
+    return read(kPosition, pos) && read(kTexcoord, tc);
+}
+
+// a depth buffer drawn as colour into another depth buffer's memory: copied as depth, into the rectangle the
+// title's quad covers and from the part of the source its texture coordinates take (the depth of field takes the
+// 640x576 frame's depth into 256x192 of a 256x256 buffer)
+bool D3D12Backend::DepthCopy(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     TextureDesc d;
     if (!s.rt.header || !s.textures[0] || !Describe(s.textures[0], d) || Format(d.format).depth || d.cube ||
         d.depth != 1) {
@@ -1283,7 +1328,32 @@ bool D3D12Backend::DepthCopy(const State& s) {
     Target& src = si->second;
     ID3D12PipelineState* pso = EnsureDepthCopyPipeline();
     if (!pso) return false;
-    DrawDepthCopy(src, dst, pso);
+    float rect[4] = {0, 0, float(dst.gw), float(dst.gh)}, uv[4] = {0, 0, 1, 1};
+    Assembled& a = asm_;
+    if (AssembleDraw(s, prim, start, count, indices, a) && a.pretransformed) {
+        // the corners nearest and farthest from the origin, as the quad's pixel edges (centres at .5 off)
+        float lo = 1e30f, hi = -1e30f, p[2], t[2], p0[2] = {}, t0[2] = {}, p1[2] = {}, t1[2] = {};
+        bool ok = a.vertex_count >= 3;
+        for (uint32_t v = 0; ok && v < std::min<uint32_t>(a.vertex_count, 8); v++) {
+            ok = Corner(a, v, p, t);
+            if (ok && p[0] + p[1] < lo) lo = p[0] + p[1], std::copy(p, p + 2, p0), std::copy(t, t + 2, t0);
+            if (ok && p[0] + p[1] > hi) hi = p[0] + p[1], std::copy(p, p + 2, p1), std::copy(t, t + 2, t1);
+        }
+        if (ok && p1[0] > p0[0] && p1[1] > p0[1]) {
+            rect[0] = p0[0] + 0.5f;
+            rect[1] = p0[1] + 0.5f;
+            rect[2] = p1[0] - p0[0];
+            rect[3] = p1[1] - p0[1];
+            // linear textures take texel coordinates
+            bool texels = std::max({std::fabs(t1[0]), std::fabs(t1[1])}) > 2.0f;
+            float tw = texels ? float(src.gw) : 1.0f, th = texels ? float(src.gh) : 1.0f;
+            uv[0] = t0[0] / tw;
+            uv[1] = t0[1] / th;
+            uv[2] = (t1[0] - t0[0]) / tw;
+            uv[3] = (t1[1] - t0[1]) / th;
+        }
+    }
+    DrawDepthCopy(src, dst, pso, rect, uv);
     return true;
 }
 
@@ -2796,7 +2866,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     PerfScope perf_draw{g_perf.draw};
     g_perf.draws++;
     if (cap_) CapStep(s.rt);
-    if (DepthCopy(s)) return;
+    if (DepthCopy(s, prim, start, count, indices)) return;
     DrawEnd draw_end{ext_};
     if (ext_) ext_->BeginDraw(s);
     Assembled& a = asm_;
