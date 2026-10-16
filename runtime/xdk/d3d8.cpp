@@ -110,6 +110,7 @@ struct RawVertex {
 };
 RawVertex g_raw;
 uint32_t g_interval = 0;  // D3DPRESENT_PARAMETERS presentation interval
+std::atomic<uint32_t> g_interval_override{0};  // the title's say, SetIntervalOverride
 void PushStat(uint32_t m);
 gpu::State RawDrawState();
 gpu::State SelectedProgramState();
@@ -625,6 +626,7 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     // XBE_FORCE_INTERVAL=<vblanks>: paced to that many vblanks whatever the title asks (tests)
     static const char* forced = std::getenv("XBE_FORCE_INTERVAL");
     if (forced) interval = uint32_t(std::atoi(forced));
+    if (uint32_t o = g_interval_override.load()) interval = o;
     LOG_FIRST(8, "d3d: presentation interval %X", interval);
     app::Pace(interval & 0x80000000u ? 0 : std::clamp<uint32_t>(interval & 0xF, 1, 4));
     // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
@@ -1073,6 +1075,7 @@ namespace {
 d3d::PixelConstantFilter g_psc_filter = nullptr;
 }  // namespace
 void d3d::SetPixelConstantFilter(PixelConstantFilter filter) { g_psc_filter = filter; }
+void d3d::SetIntervalOverride(uint32_t vblanks) { g_interval_override = vblanks; }
 
 HLE_STDCALL(D3DDevice_SetPixelShaderConstant, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
