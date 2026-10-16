@@ -1414,19 +1414,88 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over), cb.gpu, slot, si);
 }
 
+// Compiled shaders kept across runs in shadercache.bin next to the executable: a compile takes FXC tens of ms, and a
+// scene's first frame compiles dozens (a stall of seconds). Records of hash (of source, entry and profile), size and
+// bytecode, appended as compiled and read back whole at start; a changed translator makes new hashes, old records
+// are left unused. XBE_NO_SHADER_CACHE=1 turns it off.
+class ShaderDiskCache {
+public:
+    // the blob of hash, if an earlier run compiled it
+    ComPtr<ID3DBlob> Find(uint64_t hash) {
+        Load();
+        auto it = blobs_.find(hash);
+        return it == blobs_.end() ? nullptr : it->second;
+    }
+    void Store(uint64_t hash, ID3DBlob* code) {
+        if (!on_ || !code) return;
+        if (!out_) out_ = _wfopen(Path().c_str(), L"ab");
+        if (!out_) return;
+        uint32_t size = uint32_t(code->GetBufferSize());
+        if (std::ftell(out_) == 0) std::fwrite(kMagic, 1, sizeof(kMagic), out_);
+        std::fwrite(&hash, sizeof(hash), 1, out_);
+        std::fwrite(&size, sizeof(size), 1, out_);
+        std::fwrite(code->GetBufferPointer(), 1, size, out_);
+        std::fflush(out_);
+    }
+
+private:
+    static constexpr char kMagic[8] = {'X', 'S', 'H', 'C', 'A', 'C', 'H', '1'};
+    static constexpr uint32_t kMaxBlob = 1u << 20;
+    static std::filesystem::path Path() { return app::ExeDir() / "shadercache.bin"; }
+    void Load() {
+        if (loaded_) return;
+        loaded_ = true;
+        on_ = std::getenv("XBE_NO_SHADER_CACHE") == nullptr;
+        if (!on_) return;
+        FILE* f = _wfopen(Path().c_str(), L"rb");
+        if (!f) return;
+        char magic[sizeof(kMagic)];
+        bool ok = std::fread(magic, 1, sizeof(magic), f) == sizeof(magic) && !std::memcmp(magic, kMagic, sizeof(magic));
+        uint64_t hash;
+        uint32_t size;
+        while (ok && std::fread(&hash, sizeof(hash), 1, f) == 1 && std::fread(&size, sizeof(size), 1, f) == 1) {
+            ComPtr<ID3DBlob> b;
+            if (size > kMaxBlob || FAILED(D3DCreateBlob(size, &b)) ||
+                std::fread(b->GetBufferPointer(), 1, size, f) != size)
+                break;  // a record cut short by an exit mid-write ends the file
+            blobs_[hash] = b;
+        }
+        std::fclose(f);
+        if (!ok) std::filesystem::remove(Path());  // not ours: started over
+        LOGI("d3d12: %zu shaders from the shader cache", blobs_.size());
+    }
+    bool loaded_ = false, on_ = false;
+    FILE* out_ = nullptr;
+    std::unordered_map<uint64_t, ComPtr<ID3DBlob>> blobs_;
+};
+ShaderDiskCache g_disk_shaders;
+
+// FXC's optimizer doubles a compile's time and gains nothing the driver's own compiler does not: skipped.
+// XBE_FXC_FLAGS=<hex> sets the flags instead.
+UINT CompileFlags() {
+    static const char* env = std::getenv("XBE_FXC_FLAGS");
+    static const UINT flags = env ? UINT(std::strtoul(env, nullptr, 16)) : D3DCOMPILE_SKIP_OPTIMIZATION;
+    return flags;
+}
+
 ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
-    // one source can hold several entry points
-    uint64_t profile_seed = Hash(profile, std::strlen(profile));
+    // one source can hold several entry points; the flags change the code
+    uint64_t flags = CompileFlags();
+    uint64_t profile_seed = Hash(profile, std::strlen(profile), Hash(&flags, sizeof(flags)));
     uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
     hash = Hash(src.data(), src.size(), entry_seed);
     auto it = blobs_.find(hash);
     if (it != blobs_.end()) return it->second.Get();
+    if (ComPtr<ID3DBlob> cached = g_disk_shaders.Find(hash)) {
+        blobs_[hash] = cached;
+        return cached.Get();
+    }
     ComPtr<ID3DBlob> code;
     ComPtr<ID3DBlob> err;
     PerfScope perf_compile{g_perf.compile};
     g_perf.shaders++;
-    HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, profile,
-                            D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
+    HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, profile, CompileFlags(), 0, &code,
+                            &err);
     if (FAILED(hr)) {
         LOGE("d3d12: %s compile failed: %s", profile, err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
         LOGE("%s", src.c_str());
@@ -1434,6 +1503,7 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
         return nullptr;
     }
     blobs_[hash] = code;
+    g_disk_shaders.Store(hash, code.Get());
     return code.Get();
 }
 
