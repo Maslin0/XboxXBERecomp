@@ -15,6 +15,7 @@
 #include "gpu/vertex.h"
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
+#include "kernel/memory.h"
 #include "xdk/layout.h"
 
 using namespace kernel;
@@ -1186,8 +1187,32 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     return 0;
 }
 
+// XBE_DRAW_STACK=<texture data, hex> or all: each distinct guest stack of an API draw whose stage 0 texture data is
+// there (all: any, with its texture)
+static void LogDrawStack(X86Context& ctx) {
+    static const char* env = std::getenv("XBE_DRAW_STACK");
+    static const bool all = env && std::string(env) == "all";
+    static const uint32_t want = env && !all ? uint32_t(std::strtoul(env, nullptr, 16)) & 0x0FFFFFFF : 0u;
+    if (!env || !g_state.textures[0]) return;
+    uint32_t tex = R32(g_state.textures[0] + 4) & 0x0FFFFFFF;
+    if (!all && tex != want) return;
+    static std::unordered_set<std::string> seen;
+    std::string st;
+    char b[24];
+    for (uint32_t i = 0; i < 160 && st.size() < 900; i++) {
+        if (!mem::IsCommitted(ctx.esp + i * 4)) break;  // past the stack's top
+        uint32_t v = R32(ctx.esp + i * 4);
+        if (v >= 0x11000 && v < 0x13C000) {
+            std::snprintf(b, sizeof(b), " %X:%05X", i * 4, v);
+            st += b;
+        }
+    }
+    if (seen.insert(st).second) LOGE("draw stack tex %08X:%s", tex | 0x80000000, st.c_str());
+}
+
 HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     PushStat(0xD0000002u);
+    LogDrawStack(ctx);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
     SyncDeferred();
