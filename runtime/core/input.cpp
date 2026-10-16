@@ -1,11 +1,14 @@
 // controllers through SDL: Xbox, PlayStation and Switch pads read into the console controller's report
+#define NOMINMAX
 #include "core/input.h"
 
 #include <algorithm>
+#include <initializer_list>
 #include <iterator>
 #include <mutex>
 
 #include <SDL3/SDL.h>
+#include <windows.h>
 
 #include "app/app.h"
 #include "core/log.h"
@@ -50,6 +53,55 @@ void UpdatePads() {
         if (e.type == SDL_EVENT_GAMEPAD_ADDED) AddPad(e.gdevice.which);
         else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) RemovePad(e.gdevice.which);
     }
+}
+
+// The keyboard as controller 1, while the game window has the focus:
+//   steer A D / Left Right (left stick), throttle W / Up (right trigger), brake S / Down (left trigger); W S and the
+//   arrows also move the left stick up and down for the menus
+//   A Enter Space, B Backspace, X Left Shift, Y Left Ctrl, black Q, white E, Start Esc, Back Tab,
+//   right stick I J K L, d-pad the numpad's 8 2 4 6, thumbs F (left) R (right)
+void Keyboard(Pad& p) {
+    if (!app::Get().keyboard) return;
+    p.connected = true;  // a controller is there for the game even with none plugged in
+    HWND window = static_cast<HWND>(app::Window());
+    if (!window || GetForegroundWindow() != window) return;
+    auto held = [](std::initializer_list<int> keys) {
+        for (int vk : keys)
+            if (GetAsyncKeyState(vk) & 0x8000) return true;
+        return false;
+    };
+    bool any = false;
+    auto button = [&](uint16_t bit, std::initializer_list<int> keys) {
+        if (held(keys)) p.buttons |= bit, any = true;
+    };
+    auto analog = [&](int i, std::initializer_list<int> keys) {
+        if (held(keys)) p.analog[i] = 0xFF, any = true;
+    };
+    auto axis = [&](int16_t& a, std::initializer_list<int> minus, std::initializer_list<int> plus) {
+        int v = (held(plus) ? 32767 : 0) - (held(minus) ? 32767 : 0);
+        if (v) a = int16_t(v), any = true;
+    };
+    axis(p.lx, {'A', VK_LEFT}, {'D', VK_RIGHT});
+    axis(p.ly, {'S', VK_DOWN}, {'W', VK_UP});
+    axis(p.rx, {'J'}, {'L'});
+    axis(p.ry, {'K'}, {'I'});
+    analog(7, {'W', VK_UP});
+    analog(6, {'S', VK_DOWN});
+    analog(0, {VK_RETURN, VK_SPACE});
+    analog(1, {VK_BACK});
+    analog(2, {VK_LSHIFT});
+    analog(3, {VK_LCONTROL});
+    analog(4, {'Q'});
+    analog(5, {'E'});
+    button(0x01, {VK_NUMPAD8});
+    button(0x02, {VK_NUMPAD2});
+    button(0x04, {VK_NUMPAD4});
+    button(0x08, {VK_NUMPAD6});
+    button(0x10, {VK_ESCAPE});
+    button(0x20, {VK_TAB});
+    button(0x40, {'F'});
+    button(0x80, {'R'});
+    p.keyboard = any;
 }
 
 }  // namespace
@@ -107,6 +159,7 @@ Pad Poll(int port) {
             p.ry = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_RIGHTY));
         }
     }
+    if (port == 0) Keyboard(p);
     if (app::kGame.pad) app::kGame.pad(port, p);
     return p;
 }

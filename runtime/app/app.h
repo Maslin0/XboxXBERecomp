@@ -25,6 +25,7 @@ struct Settings {
     uint32_t aniso = 0;              // 0 as the game asks
     bool smaa = false;               // SMAA over the finished frame
     bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
+    bool keyboard = true;            // the keyboard works controller 1 while the window has the focus
     bool full_picture = true;        // the game's safe area (GameInfo::safe_area) fills the screen
     uint32_t language = 1;           // the console's: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks

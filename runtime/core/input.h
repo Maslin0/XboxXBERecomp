@@ -9,6 +9,7 @@ struct Pad {
     uint16_t buttons = 0;  // dpad up/down/left/right, start, back, left thumb, right thumb
     uint8_t analog[8] = {};  // A B X Y black white left trigger right trigger
     int16_t lx = 0, ly = 0, rx = 0, ry = 0;
+    bool keyboard = false;  // keys held went into it (an overlay with its own key handling can tell)
 };
 
 void Init();  // window thread, before boot
