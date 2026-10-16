@@ -1735,10 +1735,12 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
         UploadTarget(t, su);
     }
     info.kind = kTex2D;
-    // a pass shrinking it averages each tap over a console texel, else upscaled taps skip texels and ghost
+    // a pass shrinking it averages each tap over a console texel, else upscaled taps skip texels and ghost. Only a
+    // target smaller both ways: the frame copied out to the front buffer (640x576 into 720x480) is no shrink, and a
+    // box there blurred the whole picture
     Target* rt = FindTarget(s.rt, false);
     float k = float(t.w) / (t.gw * stages.k[stage]);
-    if (!t.depth && box && k > kUpscaledMin && rt && rt != &t && (t.gw > rt->gw || t.gh > rt->gh)) {
+    if (!t.depth && box && k > kUpscaledMin && rt && rt != &t && t.gw > rt->gw && t.gh > rt->gh) {
         stages.wide[stage] = k;
         info.flags |= kTexWide;
     }
