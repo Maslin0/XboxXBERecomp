@@ -2364,7 +2364,7 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
         fprintf(cap_, " ]");
     }
     // the raw path: each float input register of the first vertices as the title wrote it
-    if (a.vertices.empty() && !a.index_src) {
+    if (a.vertices.empty()) {
         for (int r = 0; r < 16; r++) {
             const VertexElement& e = a.elements[size_t(r)];
             if (!(a.regs >> r & 1)) continue;
@@ -2634,12 +2634,15 @@ void D3D12Backend::DeliverReports() {
     }
 }
 
-// STEAL_GEOM_LOG: a small raw draw with an input beyond a million or not finite, its inputs and position constants
-void LogWildVertices(const State& s, const Assembled& a, uint32_t prim) {
+// STEAL_GEOM_LOG: a small raw draw with a position (v0) beyond a million or not finite, or a quad list (sprites) with
+// a float4 corner more than kFar times its nonzero w out (far off the screen): its inputs and position constants
+void LogWildVertices(const State& s, const Assembled& a, uint32_t prim, const uint8_t* indices) {
     static const bool geom_log = std::getenv("STEAL_GEOM_LOG") != nullptr;
     constexpr uint32_t kSmall = 64;
     constexpr float kWild = 1e6f;
-    if (!geom_log || !a.vertices.empty() || a.index_src || !a.vertex_count || a.vertex_count > kSmall) return;
+    constexpr float kFar = 8.0f;
+    constexpr uint32_t kQuads = 8;  // D3DPT_QUADLIST
+    if (!geom_log || !a.vertices.empty() || indices || !a.vertex_count || a.vertex_count > kSmall) return;
     std::string line;
     bool wild = false;
     char buf[64];
@@ -2658,15 +2661,19 @@ void LogWildVertices(const State& s, const Assembled& a, uint32_t prim) {
             float f[4];
             std::memcpy(f, vb.src + size_t(v) * vb.stride + e.offset, floats * 4);
             line += " [";
+            if (prim == kQuads && (s.vs_handle & 1) && floats == 4 && r == 0 && f[3] != 0)
+                wild |= !(std::fabs(f[0]) <= kFar * std::fabs(f[3]) && std::fabs(f[1]) <= kFar * std::fabs(f[3]));
             for (uint32_t k = 0; k < floats; k++) {
-                wild |= !(std::fabs(f[k]) < kWild);
+                if (r == 0) wild |= !(std::fabs(f[k]) < kWild);
                 snprintf(buf, sizeof(buf), " %g", f[k]);
                 line += buf;
             }
             line += " ]";
         }
     }
-    if (!wild) return;
+    static int logged = 0;
+    constexpr int kMaxLogged = 3000;
+    if (!wild || ++logged > kMaxLogged) return;
     LOGE("wild vertices: rt %08X prim %u count %u vs %08X tex %08X%s", s.rt.data, prim, a.vertex_count, s.vs_handle,
          s.textures[0], line.c_str());
     for (int r : {49, 58, 59, 60}) {
@@ -2684,7 +2691,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (ext_) ext_->BeginDraw(s);
     Assembled& a = asm_;
     if (!AssembleDraw(s, prim, start, count, indices, a)) return;
-    LogWildVertices(s, a, prim);
+    LogWildVertices(s, a, prim, indices);
     // past the ring every upload is a buffer of its own: seconds lost on a frame that draws a whole level once
     if (CurrentFrame().used > kUploadSize - kUploadReserve) Submit(true);
     if (!BindTargets(s)) return;
