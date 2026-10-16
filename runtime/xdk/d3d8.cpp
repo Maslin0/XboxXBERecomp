@@ -103,12 +103,15 @@ struct RawVertex {
     uint32_t const_load = 0, const_word = 0;  // SET_TRANSFORM_CONSTANT_LOAD, hardware register order
     std::array<uint32_t, 16> offset{}, format{};  // SET_VERTEX_DATA_ARRAY_OFFSET, _FORMAT
     bool arrays = false;                      // the title has pointed the arrays itself
+    uint32_t selected = 0;                    // SelectVertexShader's handle: its declaration lays out the streams
     std::array<uint32_t, 16> headers{};       // vertex buffer headers the streams point at
 };
 RawVertex g_raw;
 uint32_t g_interval = 0;  // D3DPRESENT_PARAMETERS presentation interval
 void PushStat(uint32_t m);
 gpu::State RawDrawState();
+gpu::State SelectedProgramState();
+gpu::State DrawState();
 std::unique_ptr<gpu::Backend> g_backend;
 std::recursive_mutex g_lock;
 
@@ -919,6 +922,7 @@ HLE_STDCALL(D3DDevice_GetVertexShaderFunction, 3) {
 HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     UseApiVertexState();
+    g_raw.selected = 0;
     uint32_t h = a[0];
     g_state.vs_handle = h;
     g_state.vs = nullptr;
@@ -969,6 +973,11 @@ HLE_STDCALL(D3DDevice_SelectVertexShader, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
     g_raw.start = a[1];
+    g_raw.selected = a[0];
+    static const bool log = std::getenv("STEAL_GEOM_LOG") != nullptr;
+    static std::unordered_set<uint64_t> seen;
+    if (log && seen.insert(uint64_t(a[0]) << 32 | a[1]).second)
+        LOGE("select vertex shader %08X at %u from %05X, arrays %d", a[0], a[1], R32(ctx.esp), int(g_raw.arrays));
     return 0;
 }
 HLE_STDCALL(D3DDevice_SetShaderConstantMode, 1) {
@@ -1096,7 +1105,7 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     if (g_raw.arrays)
         LogQuadSource("arrays", a[0], a[1], a[2], mem::VirtualFromPhysical(g_raw.offset[0] & 0x7FFFFFFF),
                       g_raw.format[0] >> 8);
-    if (g_backend) g_backend->Draw(g_raw.arrays ? RawDrawState() : g_state, a[0], a[1], a[2], nullptr);
+    if (g_backend) g_backend->Draw(DrawState(), a[0], a[1], a[2], nullptr);
     return 0;
 }
 
@@ -1106,7 +1115,7 @@ HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     Walk(Dev(kDevPush));
     SyncDeferred();
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
-    if (g_backend) g_backend->Draw(g_raw.arrays ? RawDrawState() : g_state, a[0], 0, a[1], indices);
+    if (g_backend) g_backend->Draw(DrawState(), a[0], 0, a[1], indices);
     return 0;
 }
 
@@ -1285,6 +1294,43 @@ bool ApplyRawMethod(uint32_t m, uint32_t v) {
 
 // the state a draw of the title's own arrays sees: the program from the start slot to its last instruction, each
 // enabled array a stream of its own read from register r
+// the program selected from the title's program memory with SelectVertexShader, over the API's streams laid out by
+// the selected handle's declaration: what the library sends when the streams were set after the title's own arrays
+gpu::State SelectedProgramState() {
+    gpu::State s = g_state;
+    auto it = g_vs.find(g_raw.selected);
+    if (it == g_vs.end()) return s;
+    std::vector<uint32_t> program;
+    for (uint32_t i = g_raw.start; i < 136; i++) {
+        program.insert(program.end(), &g_raw.program[i * 4], &g_raw.program[i * 4 + 4]);
+        if (g_raw.program[i * 4 + 3] & 1) break;  // the final instruction
+    }
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint32_t w) { h = (h ^ w) * 1099511628211ull; };
+    for (uint32_t w : program) mix(w);
+    mix(g_raw.selected);
+    // the render thread tells shaders apart by pointer: one object per program and declaration
+    static std::unordered_map<uint64_t, std::shared_ptr<gpu::VertexShader>> made;
+    auto& vs = made[h];
+    if (!vs) {
+        vs = std::make_shared<gpu::VertexShader>(*it->second);
+        vs->handle = 1;
+        vs->program = program;
+        vs->program_type = 0x2078;
+        vs->constants.clear();
+    }
+    s.vs = vs;
+    s.vs_handle = 1;
+    return s;
+}
+
+// an API draw's vertex state: the title's own arrays and program, its program over the API's streams, or the API's
+gpu::State DrawState() {
+    if (g_raw.arrays) return RawDrawState();
+    if (g_raw.selected) return SelectedProgramState();
+    return g_state;
+}
+
 gpu::State RawDrawState() {
     gpu::State s = g_state;
     std::vector<uint32_t> program;
