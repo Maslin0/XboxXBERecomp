@@ -66,6 +66,7 @@ void UpdatePads() {
 // they are bound to, and work nothing else
 constexpr int kMenuKeys[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_SPACE, VK_BACK, VK_ESCAPE};
 std::atomic<bool> g_menu_keys{false};
+std::atomic<bool> g_keyboard_last{false};  // the keyboard used since controller 1 last was
 
 bool Down(int vk) { return GetAsyncKeyState(vk) & 0x8000; }
 
@@ -269,10 +270,21 @@ Pad Poll(int port) {
             p.ry = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_RIGHTY));
         }
     }
-    if (port == 0) Keyboard(p);
+    if (port == 0) {
+        // whichever was used last, the keyboard or controller 1, for a title's prompts
+        constexpr int16_t kPushed = 16000;
+        auto pushed = [](int16_t v) { return v > kPushed || v < -kPushed; };
+        bool pad = p.buttons || pushed(p.lx) || pushed(p.ly) || pushed(p.rx) || pushed(p.ry);
+        for (uint8_t a : p.analog) pad |= a > 0x20;
+        if (pad) g_keyboard_last = false;
+        Keyboard(p);
+        if (p.keyboard) g_keyboard_last = true;
+    }
     if (app::kGame.pad) app::kGame.pad(port, p);
     return p;
 }
+
+bool KeyboardActive() { return g_keyboard_last && app::Get().keyboard; }
 
 // the motors run until set again
 void Rumble(int port, uint16_t left, uint16_t right) {

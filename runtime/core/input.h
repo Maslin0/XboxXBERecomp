@@ -30,6 +30,8 @@ const char* ControlId(int control);  // its name in [keys]
 const char* KeyName(uint16_t vk);    // in capitals, as on a US keyboard ("" for none)
 // the title is in a menu: the arrows, Enter, Space, Backspace and Escape work it as the d-pad, A and B
 void SetMenuKeys(bool menu);
+// the keyboard was used last rather than controller 1 (and is on): a title shows its keys in its prompts
+bool KeyboardActive();
 
 void Init();  // window thread, before boot
 // the controller on that port, then GameInfo::pad
