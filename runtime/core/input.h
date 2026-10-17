@@ -28,6 +28,8 @@ KeyMap& Keys();
 const KeyMap& DefaultKeys();
 const char* ControlId(int control);  // its name in [keys]
 const char* KeyName(uint16_t vk);    // in capitals, as on a US keyboard ("" for none)
+// the title is in a menu: the arrows, Enter, Space, Backspace and Escape work it as the d-pad, A and B
+void SetMenuKeys(bool menu);
 
 void Init();  // window thread, before boot
 // the controller on that port, then GameInfo::pad

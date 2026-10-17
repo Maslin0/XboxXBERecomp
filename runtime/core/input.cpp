@@ -3,6 +3,7 @@
 #include "core/input.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <initializer_list>
 #include <iterator>
@@ -61,18 +62,36 @@ void UpdatePads() {
 //   arrows also move the left stick up and down for the menus
 //   A Enter Space, B Backspace, X Left Shift, Y Left Ctrl, black Q, white E, Start Esc, Back Tab,
 //   right stick I J K L, d-pad the numpad's 8 2 4 6, thumbs F (left) R (right)
+// In the title's menus (SetMenuKeys) the arrows are the d-pad, Enter and Space A, Backspace and Escape B, whatever
+// they are bound to, and work nothing else
+constexpr int kMenuKeys[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_SPACE, VK_BACK, VK_ESCAPE};
+std::atomic<bool> g_menu_keys{false};
+
+bool Down(int vk) { return GetAsyncKeyState(vk) & 0x8000; }
+
 void Keyboard(Pad& p) {
     if (!app::Get().keyboard) return;
     p.connected = true;  // a controller is there for the game even with none plugged in
     HWND window = static_cast<HWND>(app::Window());
     if (!window || GetForegroundWindow() != window) return;
     const KeyMap& keys = Keys();
+    bool menu = g_menu_keys;
+    auto fixed = [&](uint16_t vk) {
+        return menu && std::find(std::begin(kMenuKeys), std::end(kMenuKeys), vk) != std::end(kMenuKeys);
+    };
     auto held = [&](Control c) {
         for (uint16_t vk : keys[size_t(c)])
-            if (vk && (GetAsyncKeyState(vk) & 0x8000)) return true;
+            if (vk && !fixed(vk) && Down(vk)) return true;
         return false;
     };
     bool any = false;
+    if (menu) {
+        static const uint16_t kDpad[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT};
+        for (int i = 0; i < 4; i++)
+            if (Down(kDpad[i])) p.buttons |= uint16_t(1u << i), any = true;
+        if (Down(VK_RETURN) || Down(VK_SPACE)) p.analog[0] = 0xFF, any = true;
+        if (Down(VK_BACK) || Down(VK_ESCAPE)) p.analog[1] = 0xFF, any = true;
+    }
     auto button = [&](uint16_t bit, Control c) {
         if (held(c)) p.buttons |= bit, any = true;
     };
@@ -194,6 +213,8 @@ const char* KeyName(uint16_t vk) {
             return buf;
     }
 }
+
+void SetMenuKeys(bool menu) { g_menu_keys = menu; }
 
 void Init() {
     // WGI reads the triggers apart and HIDAPI takes PlayStation and Switch pads. Reads come from the guest's threads,
