@@ -71,7 +71,12 @@ void Write(Level lv, const char* fmt, ...) {
     n = std::min(n, int(sizeof(line)) - 1);
     if (g_file) {
         std::fwrite(line, 1, size_t(n), g_file);
-        if (lv >= Level::Warn) std::fflush(g_file);
+        // warnings at once, the rest each second: a killed process keeps all but its last second
+        static double flushed = 0;
+        if (lv >= Level::Warn || t - flushed >= 1.0) {
+            std::fflush(g_file);
+            flushed = t;
+        }
     }
     std::fwrite(line, 1, size_t(n), stderr);
 }

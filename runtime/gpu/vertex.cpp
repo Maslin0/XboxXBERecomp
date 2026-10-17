@@ -1,6 +1,7 @@
 #include "gpu/vertex.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include <dxgiformat.h>
@@ -276,8 +277,8 @@ bool RawReadable(const State& s, const Inputs& inputs) {
         bool readable = he.format && stride && stride % kStrideAlign == 0 && in.offset < kElementOffsetEnd &&
                         in.offset % std::min<uint32_t>(he.bytes, 4) == 0;
         if (!readable) {
-            LOG_FIRST(32, "vertex: converted on the CPU: v%d type %02X offset %u stride %u", inputs.regs[k], in.type,
-                      in.offset, stride);
+            LOG_FIRST(32, "vertex: repacked or converted on the CPU: v%d type %02X offset %u stride %u", inputs.regs[k],
+                      in.type, in.offset, stride);
             return false;
         }
     }
@@ -367,6 +368,61 @@ bool AssembleRaw(const State& s, const Inputs& inputs, const DrawRange& d, Assem
         out.decode |= uint64_t(he.decode) << (reg * 4);
     }
     out.vertex_count = dense ? d.span : d.count;
+    if (NativePrimitive(d.prim)) return DrawNative(d, dense, out);
+    auto local = [&](uint32_t i) { return dense ? DrawVertex(s, d, i) - d.first_vertex : i; };
+    ListIndices(d.prim, d.count, local, out.indices, out.topology);
+    return UseIndexList(out);
+}
+
+// every element has a format the input assembler reads, only its stride or offset is off the dword grid
+bool Repackable(const Inputs& inputs) {
+    for (int k = 0; k < inputs.nregs; k++) {
+        if (!HostFormat(inputs.layout.inputs[size_t(inputs.regs[k])].type).format) return false;
+    }
+    return true;
+}
+
+// the guest's bytes moved into dword aligned slots, one interleaved buffer, the formats kept: what the input assembler
+// can't read in place (strides of 10, 11, 14 bytes) without converting each element to a float4
+bool AssembleRepacked(const State& s, const Inputs& inputs, const DrawRange& d, Assembled& out) {
+    using namespace kernel;
+    struct Element {
+        const uint8_t* src;
+        uint32_t stride;
+        uint32_t offset;  // in the repacked vertex
+        uint32_t bytes;   // copied from the guest
+        uint32_t slot;    // bytes in the repacked vertex
+    };
+    Element el[16];
+    uint32_t stride = 0;
+    for (int k = 0; k < inputs.nregs; k++) {
+        int reg = inputs.regs[k];
+        const auto& in = inputs.layout.inputs[size_t(reg)];
+        const auto& st = s.streams[size_t(in.stream)];
+        HostElement he = HostFormat(in.type);
+        uint32_t data = mem::VirtualFromPhysical(R32(st.vb + kResData));
+        uint32_t slot = (uint32_t(he.bytes) + 3) & ~3u;
+        el[k] = {static_cast<const uint8_t*>(HostPtr(data + in.offset)), StrideOf(s, inputs.layout, in), stride,
+                 std::min<uint32_t>(TypeBytes(in.type), he.bytes), slot};
+        out.elements[size_t(reg)] = {he.format, 0, uint16_t(stride)};
+        out.decode |= uint64_t(he.decode) << (reg * 4);
+        stride += slot;
+    }
+    bool dense = uint64_t(d.span) <= uint64_t(d.count) * kDenseSpanPerVertex + kDenseSpanSlack;
+    uint32_t n = dense ? d.span : d.count;
+    auto& g = out.gathered[0];
+    g.assign(size_t(n) * stride, 0);
+    for (uint32_t v = 0; v < n; v++) {
+        uint32_t id = dense ? d.first_vertex + v : DrawVertex(s, d, v);
+        uint8_t* o = &g[size_t(v) * stride];
+        for (int k = 0; k < inputs.nregs; k++) {
+            const Element& e = el[k];
+            std::memcpy(o + e.offset, e.src + size_t(id) * e.stride, e.bytes);
+        }
+    }
+    out.buffer_count = 1;
+    out.buffers[0] = {g.data(), n * stride, stride};
+    out.vertex_count = n;
     if (NativePrimitive(d.prim)) return DrawNative(d, dense, out);
     auto local = [&](uint32_t i) { return dense ? DrawVertex(s, d, i) - d.first_vertex : i; };
     ListIndices(d.prim, d.count, local, out.indices, out.topology);
@@ -469,6 +525,9 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
     // the guest's own vertices when the input assembler can read every element of them
     bool raw = kRawVertices && RawReadable(s, inputs);
     if (raw) return AssembleRaw(s, inputs, d, out);
+    // XBE_NO_REPACK=1: those converted to float4s as before (A/B)
+    static const bool repack = !std::getenv("XBE_NO_REPACK");
+    if (kRawVertices && repack && Repackable(inputs)) return AssembleRepacked(s, inputs, d, out);
     return AssembleConverted(s, inputs, d, out);
 }
 
