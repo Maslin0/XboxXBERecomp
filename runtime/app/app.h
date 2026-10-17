@@ -25,6 +25,7 @@ struct Settings {
     uint32_t aniso = 0;              // 0 as the game asks
     float lod_bias = 0;              // added to mipmapped textures' level of detail: below 0 sharper far away
     bool smaa = false;               // SMAA over the finished frame
+    bool async_shaders = true;       // a draw whose shader is still compiling is skipped instead of waited for
     bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
     bool keyboard = true;            // the keyboard works controller 1 while the window has the focus
     bool full_picture = true;        // the game's safe area (GameInfo::safe_area) fills the screen

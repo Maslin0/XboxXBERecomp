@@ -21,6 +21,8 @@
 #include <filesystem>
 #include <mutex>
 #include <optional>
+#include <condition_variable>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -608,6 +610,10 @@ private:
     void DeliverReports();
     // shaders by source hash: Compile returns the bytecode and sets hash
     ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
+    // a draw's shader: with async shaders a missing one is made on a worker and null is returned meanwhile
+    ID3DBlob* CompileDraw(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
+    // what the workers finished, into blobs_ and psos_
+    void TakeAsync();
     // Blit's pipeline
     ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over = false);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv) const;
@@ -738,6 +744,7 @@ private:
     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> blobs_;
     std::unordered_map<uint64_t, uint64_t> shader_src_;  // vertex and pixel program keys to source hash
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
+    std::unordered_set<uint64_t> pending_shaders_, pending_psos_;  // given to the workers, not back yet
     std::unordered_map<uint64_t, uint32_t> samplers_;
     uint32_t smp_used_ = 0;
     std::unordered_map<uint64_t, Target> targets_;
@@ -1484,43 +1491,54 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over), cb.gpu, slot, si);
 }
 
-// Compiled shaders kept across runs in shadercache.bin next to the executable: a compile takes FXC tens of ms, and a
-// scene's first frame compiles dozens (a stall of seconds). Records of hash (of source, entry and profile), size and
-// bytecode, appended as compiled and read back whole at start; a changed translator makes new hashes, old records
-// are left unused. XBE_NO_SHADER_CACHE=1 turns it off.
-class ShaderDiskCache {
+// Compiled shaders and pipelines kept across runs in shadercache\ next to the executable: a compile takes FXC tens of
+// ms and a pipeline the driver a few, and a scene's first frame makes dozens (a stall of seconds). Records of hash,
+// size and blob (shaders: bytecode by hash of source, entry and profile; pipelines: the driver's cached blob by hash of
+// the pipeline's key), appended as made and read back whole at start; a changed translator makes new hashes, old
+// records are left unused, a pipeline blob another driver refuses is made again. XBE_NO_SHADER_CACHE=1 turns both
+// off. Workers store from their threads.
+class DiskCache {
 public:
-    // the blob of hash, if an earlier run compiled it
+    DiskCache(const char* file, const char (&magic)[9]) : file_(file) { std::memcpy(magic_, magic, 8); }
+    // the blob of hash, if an earlier run made it
     ComPtr<ID3DBlob> Find(uint64_t hash) {
+        std::lock_guard lock(m_);
         Load();
         auto it = blobs_.find(hash);
         return it == blobs_.end() ? nullptr : it->second;
     }
-    void Store(uint64_t hash, ID3DBlob* code) {
-        if (!on_ || !code) return;
+    void Store(uint64_t hash, const void* data, size_t bytes) {
+        std::lock_guard lock(m_);
+        Load();
+        if (!on_ || !data || !bytes || bytes > kMaxBlob) return;
         if (!out_) out_ = _wfopen(Path().c_str(), L"ab");
         if (!out_) return;
-        uint32_t size = uint32_t(code->GetBufferSize());
-        if (std::ftell(out_) == 0) std::fwrite(kMagic, 1, sizeof(kMagic), out_);
+        uint32_t size = uint32_t(bytes);
+        if (std::ftell(out_) == 0) std::fwrite(magic_, 1, sizeof(magic_), out_);
         std::fwrite(&hash, sizeof(hash), 1, out_);
         std::fwrite(&size, sizeof(size), 1, out_);
-        std::fwrite(code->GetBufferPointer(), 1, size, out_);
+        std::fwrite(data, 1, size, out_);
         std::fflush(out_);
     }
 
 private:
-    static constexpr char kMagic[8] = {'X', 'S', 'H', 'C', 'A', 'C', 'H', '1'};
-    static constexpr uint32_t kMaxBlob = 1u << 20;
-    static std::filesystem::path Path() { return app::ExeDir() / "shadercache.bin"; }
+    static constexpr uint32_t kMaxBlob = 4u << 20;
+    std::filesystem::path Path() const { return app::ExeDir() / "shadercache" / file_; }
     void Load() {
         if (loaded_) return;
         loaded_ = true;
         on_ = std::getenv("XBE_NO_SHADER_CACHE") == nullptr;
         if (!on_) return;
+        std::error_code ec;
+        std::filesystem::create_directories(Path().parent_path(), ec);
+        // the shaders' file of before, beside the executable
+        std::filesystem::path old = app::ExeDir() / "shadercache.bin";
+        if (!std::strcmp(file_, "shaders.bin") && !std::filesystem::exists(Path(), ec) && std::filesystem::exists(old, ec))
+            std::filesystem::rename(old, Path(), ec);
         FILE* f = _wfopen(Path().c_str(), L"rb");
         if (!f) return;
-        char magic[sizeof(kMagic)];
-        bool ok = std::fread(magic, 1, sizeof(magic), f) == sizeof(magic) && !std::memcmp(magic, kMagic, sizeof(magic));
+        char magic[sizeof(magic_)];
+        bool ok = std::fread(magic, 1, sizeof(magic), f) == sizeof(magic) && !std::memcmp(magic, magic_, sizeof(magic));
         uint64_t hash;
         uint32_t size;
         while (ok && std::fread(&hash, sizeof(hash), 1, f) == 1 && std::fread(&size, sizeof(size), 1, f) == 1) {
@@ -1531,14 +1549,147 @@ private:
             blobs_[hash] = b;
         }
         std::fclose(f);
-        if (!ok) std::filesystem::remove(Path());  // not ours: started over
-        LOGI("d3d12: %zu shaders from the shader cache", blobs_.size());
+        if (!ok) std::filesystem::remove(Path(), ec);  // not ours: started over
+        LOGI("d3d12: %zu records from shadercache\\%s", blobs_.size(), file_);
     }
+    const char* file_;
+    char magic_[8];
+    std::mutex m_;
     bool loaded_ = false, on_ = false;
     FILE* out_ = nullptr;
     std::unordered_map<uint64_t, ComPtr<ID3DBlob>> blobs_;
 };
-ShaderDiskCache g_disk_shaders;
+DiskCache g_disk_shaders("shaders.bin", "XSHCACH1");
+DiskCache g_disk_pipelines("pipelines.bin", "XPSOCAC1");
+
+// a pipeline from the driver, from its blob of an earlier run when it takes it; new ones are kept for the next
+ComPtr<ID3D12PipelineState> MakePipeline(ID3D12Device* dev, uint64_t key, D3D12_GRAPHICS_PIPELINE_STATE_DESC d) {
+    ComPtr<ID3D12PipelineState> pso;
+    if (ComPtr<ID3DBlob> cached = g_disk_pipelines.Find(key)) {
+        d.CachedPSO = {cached->GetBufferPointer(), cached->GetBufferSize()};
+        if (SUCCEEDED(dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return pso;
+        d.CachedPSO = {};
+    }
+    if (FAILED(dev->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) {
+        LOGE("d3d12: pipeline creation failed");
+        return nullptr;
+    }
+    ComPtr<ID3DBlob> blob;
+    if (SUCCEEDED(pso->GetCachedBlob(&blob)) && blob)
+        g_disk_pipelines.Store(key, blob->GetBufferPointer(), blob->GetBufferSize());
+    return pso;
+}
+
+// Shaders and pipelines made on threads of their own (Settings::async_shaders, as SCDA's and BLACK's ports): a draw
+// whose shader or pipeline is not made yet is skipped for the frames it takes, instead of the frame waiting for FXC
+// and the driver. The render thread hands jobs over and takes back what is done before each draw.
+class AsyncMaker {
+public:
+    struct Pipeline {
+        uint64_t key = 0;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+        std::array<D3D12_INPUT_ELEMENT_DESC, 16> el{};
+        ComPtr<ID3DBlob> vs, ps, gs;
+        ComPtr<ID3D12RootSignature> root;
+    };
+    void Shader(uint64_t hash, std::string src, const char* entry, const char* profile, UINT flags) {
+        Start();
+        {
+            std::lock_guard lock(m_);
+            shader_jobs_.push_back({hash, std::move(src), entry, profile, flags});
+        }
+        cv_.notify_one();
+    }
+    void Pipe(ID3D12Device* dev, std::unique_ptr<Pipeline> job) {
+        Start();
+        {
+            std::lock_guard lock(m_);
+            dev_ = dev;
+            pso_jobs_.push_back(std::move(job));
+        }
+        cv_.notify_one();
+    }
+    bool Done() const { return done_.load(std::memory_order_acquire); }
+    void Take(std::vector<std::pair<uint64_t, ComPtr<ID3DBlob>>>& shaders,
+              std::vector<std::pair<uint64_t, ComPtr<ID3D12PipelineState>>>& psos) {
+        std::lock_guard lock(m_);
+        shaders.swap(shaders_done_);
+        psos.swap(psos_done_);
+        done_ = false;
+    }
+
+private:
+    struct ShaderJob {
+        uint64_t hash = 0;
+        std::string src;
+        const char* entry = nullptr;
+        const char* profile = nullptr;
+        UINT flags = 0;
+    };
+    void Start() {
+        if (started_) return;
+        started_ = true;
+        unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 4u);
+        for (unsigned i = 0; i < n; i++)
+            std::thread([this] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                Run();
+            }).detach();
+    }
+    void Run() {
+        for (;;) {
+            ShaderJob sj;
+            std::unique_ptr<Pipeline> pj;
+            ID3D12Device* dev = nullptr;
+            {
+                std::unique_lock lock(m_);
+                cv_.wait(lock, [&] { return !shader_jobs_.empty() || !pso_jobs_.empty(); });
+                // shaders first: pipelines wait for them anyway
+                if (!shader_jobs_.empty()) {
+                    sj = std::move(shader_jobs_.front());
+                    shader_jobs_.pop_front();
+                } else {
+                    pj = std::move(pso_jobs_.front());
+                    pso_jobs_.pop_front();
+                    dev = dev_;
+                }
+            }
+            if (pj) {
+                ComPtr<ID3D12PipelineState> pso = MakePipeline(dev, pj->key, pj->d);
+                std::lock_guard lock(m_);
+                psos_done_.push_back({pj->key, pso});
+                done_ = true;
+                continue;
+            }
+            ComPtr<ID3DBlob> code, err;
+            HRESULT hr = D3DCompile(sj.src.data(), sj.src.size(), nullptr, nullptr, nullptr, sj.entry, sj.profile, sj.flags,
+                                    0, &code, &err);
+            if (FAILED(hr)) {
+                LOGE("d3d12: %s compile failed: %s", sj.profile, err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+                LOGE("%s", sj.src.c_str());
+                code = nullptr;
+            } else {
+                g_disk_shaders.Store(sj.hash, code->GetBufferPointer(), code->GetBufferSize());
+            }
+            std::lock_guard lock(m_);
+            shaders_done_.push_back({sj.hash, code});
+            done_ = true;
+        }
+    }
+    bool started_ = false;
+    ID3D12Device* dev_ = nullptr;
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::deque<ShaderJob> shader_jobs_;
+    std::deque<std::unique_ptr<Pipeline>> pso_jobs_;
+    std::vector<std::pair<uint64_t, ComPtr<ID3DBlob>>> shaders_done_;
+    std::vector<std::pair<uint64_t, ComPtr<ID3D12PipelineState>>> psos_done_;
+    std::atomic<bool> done_{false};
+};
+AsyncMaker g_async;
+
+// XBE_SYNC_SHADERS=1: every shader made when first drawn, the frame waiting (for captures and tests)
+bool AsyncShaders() { return app::Get().async_shaders && !std::getenv("XBE_SYNC_SHADERS"); }
 
 // FXC's optimizer doubles a compile's time and gains nothing the driver's own compiler does not: skipped.
 // XBE_FXC_FLAGS=<hex> sets the flags instead.
@@ -1548,12 +1699,47 @@ UINT CompileFlags() {
     return flags;
 }
 
-ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
-    // one source can hold several entry points; the flags change the code
+// one source can hold several entry points; the flags change the code
+uint64_t ShaderHash(const std::string& src, const char* entry, const char* profile) {
     uint64_t flags = CompileFlags();
     uint64_t profile_seed = Hash(profile, std::strlen(profile), Hash(&flags, sizeof(flags)));
     uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
-    hash = Hash(src.data(), src.size(), entry_seed);
+    return Hash(src.data(), src.size(), entry_seed);
+}
+
+ID3DBlob* D3D12Backend::CompileDraw(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
+    if (!AsyncShaders()) return Compile(src, entry, profile, hash);
+    hash = ShaderHash(src, entry, profile);
+    auto it = blobs_.find(hash);
+    if (it != blobs_.end()) return it->second.Get();
+    if (ComPtr<ID3DBlob> cached = g_disk_shaders.Find(hash)) {
+        blobs_[hash] = cached;
+        return cached.Get();
+    }
+    if (pending_shaders_.insert(hash).second) {
+        g_perf.shaders++;
+        g_async.Shader(hash, src, entry, profile, CompileFlags());
+    }
+    return nullptr;
+}
+
+void D3D12Backend::TakeAsync() {
+    if (!g_async.Done()) return;
+    std::vector<std::pair<uint64_t, ComPtr<ID3DBlob>>> shaders;
+    std::vector<std::pair<uint64_t, ComPtr<ID3D12PipelineState>>> psos;
+    g_async.Take(shaders, psos);
+    for (auto& [h, b] : shaders) {
+        blobs_[h] = b;
+        pending_shaders_.erase(h);
+    }
+    for (auto& [h, p] : psos) {
+        psos_[h] = p;
+        pending_psos_.erase(h);
+    }
+}
+
+ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash) {
+    hash = ShaderHash(src, entry, profile);
     auto it = blobs_.find(hash);
     if (it != blobs_.end()) return it->second.Get();
     if (ComPtr<ID3DBlob> cached = g_disk_shaders.Find(hash)) {
@@ -1573,7 +1759,7 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
         return nullptr;
     }
     blobs_[hash] = code;
-    g_disk_shaders.Store(hash, code.Get());
+    g_disk_shaders.Store(hash, code->GetBufferPointer(), code->GetBufferSize());
     return code.Get();
 }
 
@@ -1770,17 +1956,29 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
     uint64_t h = Hash(&k, sizeof(k));
     auto it = psos_.find(h);
     if (it != psos_.end()) return it->second.Get();
-    D3D12_INPUT_ELEMENT_DESC el[16];
-    uint32_t n = FillInputLayout(k, el);
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
-    d.InputLayout = {el, n};
+    if (pending_psos_.count(h)) return nullptr;
+    auto job = std::make_unique<AsyncMaker::Pipeline>();
+    job->key = h;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC& d = job->d;
+    d.InputLayout = {job->el.data(), FillInputLayout(k, job->el.data())};
     FillPipelineDesc(k, vs, ps, d);
     if (k.topo == uint32_t(Topology::Points)) ExpandPoints(d);
-    ComPtr<ID3D12PipelineState> pso;
     g_perf.psos++;
-    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) LOGE("d3d12: pipeline creation failed");
-    psos_[h] = pso;
-    return pso.Get();
+    if (!AsyncShaders()) {
+        psos_[h] = MakePipeline(dev_.Get(), h, d);
+        return psos_[h].Get();
+    }
+    // the blobs and root signature the description points at outlive the job
+    job->vs = vs;
+    job->ps = ps;
+    job->root = root_;
+    if (d.GS.pShaderBytecode) {
+        uint64_t gh;
+        job->gs = Compile(PointHlsl(), "main", "gs_5_0", gh);
+    }
+    pending_psos_.insert(h);
+    g_async.Pipe(dev_.Get(), std::move(job));
+    return nullptr;
 }
 
 TexKind TextureKind(const TextureDesc& d) {
@@ -2170,12 +2368,13 @@ std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh
 void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawShaders& sh) {
     auto vit = shader_src_.find(sh.vkey);
     if (vit != shader_src_.end()) {
-        sh.vs_code = blobs_[vit->second].Get();
+        auto b = blobs_.find(vit->second);  // none while a worker makes it
+        sh.vs_code = b == blobs_.end() ? nullptr : b->second.Get();
         sh.vh = vit->second;
         return;
     }
     std::string src = VertexHlsl(s, a, sh);
-    sh.vs_code = Compile(sh.quad ? QuadHlsl(std::move(src)) : src, "main", "vs_5_0", sh.vh);
+    sh.vs_code = CompileDraw(sh.quad ? QuadHlsl(std::move(src)) : src, "main", "vs_5_0", sh.vh);
     shader_src_[sh.vkey] = sh.vh;
 }
 
@@ -2196,11 +2395,12 @@ void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
     // pixel shaders share the map with vertex shaders, the salt keeps their keys apart
     auto pit = shader_src_.find(sh.pkey ^ kPixelKeySalt);
     if (pit != shader_src_.end()) {
-        sh.ps_code = blobs_[pit->second].Get();
+        auto b = blobs_.find(pit->second);  // none while a worker makes it
+        sh.ps_code = b == blobs_.end() ? nullptr : b->second.Get();
         sh.ph = pit->second;
         return;
     }
-    sh.ps_code = Compile(PixelHlsl(pk), "main", "ps_5_0", sh.ph);
+    sh.ps_code = CompileDraw(PixelHlsl(pk), "main", "ps_5_0", sh.ph);
     shader_src_[sh.pkey ^ kPixelKeySalt] = sh.ph;
 }
 
@@ -2871,6 +3071,7 @@ void LogWildVertices(const State& s, const Assembled& a, uint32_t prim, const ui
 void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     PerfScope perf_draw{g_perf.draw};
     g_perf.draws++;
+    TakeAsync();
     if (cap_) CapStep(s.rt);
     if (DepthCopy(s, prim, start, count, indices)) return;
     DrawEnd draw_end{ext_};

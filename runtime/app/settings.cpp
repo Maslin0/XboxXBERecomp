@@ -51,6 +51,7 @@ void Load() {
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.smaa = t["smaa"].value_or(s.smaa);
+    s.async_shaders = t["async_shaders"].value_or(s.async_shaders);
     s.monitor = t["monitor"].value_or(s.monitor);
     s.pause_on_focus_loss = t["pause_on_focus_loss"].value_or(s.pause_on_focus_loss);
     s.keyboard = t["keyboard"].value_or(s.keyboard);
@@ -86,6 +87,7 @@ toml::table Table() {
                   {"vsync", s.vsync},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"smaa", s.smaa},
+                  {"async_shaders", s.async_shaders},
                   {"monitor", s.monitor},
                   {"pause_on_focus_loss", s.pause_on_focus_loss},
                   {"keyboard", s.keyboard},
