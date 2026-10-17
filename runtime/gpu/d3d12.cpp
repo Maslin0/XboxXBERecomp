@@ -1514,7 +1514,10 @@ public:
         if (!out_) out_ = _wfopen(Path().c_str(), L"ab");
         if (!out_) return;
         uint32_t size = uint32_t(bytes);
-        if (std::ftell(out_) == 0) std::fwrite(magic_, 1, sizeof(magic_), out_);
+        // an append stream tells 0 until it writes: the file's own size says whether it has its header
+        std::error_code ec;
+        if (!std::filesystem::exists(Path(), ec) || std::filesystem::file_size(Path(), ec) == 0)
+            std::fwrite(magic_, 1, sizeof(magic_), out_);
         std::fwrite(&hash, sizeof(hash), 1, out_);
         std::fwrite(&size, sizeof(size), 1, out_);
         std::fwrite(data, 1, size, out_);
@@ -1541,16 +1544,44 @@ private:
         bool ok = std::fread(magic, 1, sizeof(magic), f) == sizeof(magic) && !std::memcmp(magic, magic_, sizeof(magic));
         uint64_t hash;
         uint32_t size;
-        while (ok && std::fread(&hash, sizeof(hash), 1, f) == 1 && std::fread(&size, sizeof(size), 1, f) == 1) {
+        size_t records = 0;
+        bool untidy = false;
+        while (ok && std::fread(&hash, sizeof(hash), 1, f) == 1) {
+            // a header again mid-file: earlier builds wrote one each run (and stopped reading there)
+            if (!std::memcmp(&hash, magic_, sizeof(hash))) {
+                untidy = true;
+                continue;
+            }
             ComPtr<ID3DBlob> b;
-            if (size > kMaxBlob || FAILED(D3DCreateBlob(size, &b)) ||
-                std::fread(b->GetBufferPointer(), 1, size, f) != size)
-                break;  // a record cut short by an exit mid-write ends the file
+            if (std::fread(&size, sizeof(size), 1, f) != 1 || size > kMaxBlob || FAILED(D3DCreateBlob(size, &b)) ||
+                std::fread(b->GetBufferPointer(), 1, size, f) != size) {
+                untidy = true;  // a record cut short by an exit mid-write ends the file
+                break;
+            }
             blobs_[hash] = b;
+            records++;
         }
         std::fclose(f);
         if (!ok) std::filesystem::remove(Path(), ec);  // not ours: started over
-        LOGI("d3d12: %zu records from shadercache\\%s", blobs_.size(), file_);
+        // stray headers, a cut record or records made again (what earlier builds could not read): written anew
+        if (ok && (untidy || records > blobs_.size() + 64)) Rewrite();
+        LOGI("d3d12: %zu records from shadercache\\%s (%zu read)", blobs_.size(), file_, records);
+    }
+    void Rewrite() {
+        std::error_code ec;
+        std::filesystem::path tmp = Path();
+        tmp += ".new";
+        FILE* f = _wfopen(tmp.c_str(), L"wb");
+        if (!f) return;
+        bool ok = std::fwrite(magic_, 1, sizeof(magic_), f) == sizeof(magic_);
+        for (auto& [hash, b] : blobs_) {
+            uint32_t size = uint32_t(b->GetBufferSize());
+            ok = ok && std::fwrite(&hash, sizeof(hash), 1, f) == 1 && std::fwrite(&size, sizeof(size), 1, f) == 1 &&
+                 std::fwrite(b->GetBufferPointer(), 1, size, f) == size;
+        }
+        std::fclose(f);
+        if (ok) std::filesystem::rename(tmp, Path(), ec);
+        else std::filesystem::remove(tmp, ec);
     }
     const char* file_;
     char magic_[8];
