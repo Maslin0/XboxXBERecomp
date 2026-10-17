@@ -872,7 +872,19 @@ BUFFER(SetBufferData, 3) {
     return 0;
 }
 BUFFER(Play, 4) {
-    if (g_audio_log) LOGE("play %08X flags %X data %08X", v.obj, a[3], v.data);
+    if (g_audio_log) {
+        float g[2][2];
+        Levels(v, g);
+        const Voice* o = v.output ? Find(v.output) : nullptr;
+        float og[2][2] = {};
+        if (o) Levels(*const_cast<Voice*>(o), og);
+        LOGE("play %08X flags %X data %08X bytes %u ch %u rate %u freq %u vol %.2f gain %.2f/%.2f -> %08X%s nbins %u, "
+             "output vol %.2f head %.2f gain %.2f/%.2f eg %d %.2f played %d playing %d ch %u nbins %u",
+             v.obj, a[3], v.data, v.bytes, v.channels, v.rate, v.freq, v.volume, g[0][0], g[0][1], v.output,
+             v.output && !o ? " (missing)" : "", v.nbins, o ? o->volume : 0.0f, o ? o->headroom : 0.0f, og[0][0], og[0][1],
+             o ? int(o->eg.enabled) : -1, o ? o->eg.level : 0.0f, o ? int(o->played) : -1, o ? int(o->playing) : -1,
+             o ? o->channels : 0, o ? o->nbins : 0);
+    }
     if (!v.playing || (a[3] & 2)) v.eg.Start();
     v.playing = v.played = true;
     v.looping = a[3] & 1;
