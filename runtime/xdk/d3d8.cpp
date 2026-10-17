@@ -107,15 +107,28 @@ struct RawVertex {
     uint32_t selected = 0;                    // the last handle selected or set: its declaration lays out the streams
     bool own_program = false;                 // the program runs from the title's program memory (selected or pushed)
     std::array<uint32_t, 16> headers{};       // vertex buffer headers the streams point at
+    uint32_t version = 1;  // counts changes to the program, its start, the arrays' formats or the selected handle
 };
 RawVertex g_raw;
 uint32_t g_interval = 0;  // D3DPRESENT_PARAMETERS presentation interval
 std::atomic<uint32_t> g_interval_override{0};  // the title's say, SetIntervalOverride
 void PushStat(uint32_t m);
-gpu::State RawDrawState();
-gpu::State SelectedProgramState();
+// A draw's own vertex state (the title's arrays and program, or its program over the API's streams) laid over g_state
+// for the call and put back after: the state is some 47 KB, a copy for every draw cost the title's thread a third of
+// its time.
+struct VertexOverlay {
+    bool on = false;
+    std::shared_ptr<gpu::VertexShader> vs;
+    uint32_t vs_handle = 0, base_vertex = 0;
+    decltype(gpu::State::streams) streams{};
+    void Save();
+    ~VertexOverlay();
+};
+void RawDrawState(VertexOverlay& o);
+std::shared_ptr<gpu::VertexShader> RawProgram();
+void SelectedProgramState(VertexOverlay& o);
 bool DirectHandle(uint32_t h);
-gpu::State DrawState();
+const gpu::State& DrawState(VertexOverlay& o);
 std::unique_ptr<gpu::Backend> g_backend;
 std::recursive_mutex g_lock;
 
@@ -931,6 +944,7 @@ HLE_STDCALL(D3DDevice_SetVertexShader, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     UseApiVertexState();
     g_raw.selected = a[0];
+    g_raw.version++;
     g_raw.own_program = false;
     uint32_t h = a[0];
     g_state.vs_handle = h;
@@ -984,6 +998,7 @@ HLE_STDCALL(D3DDevice_SelectVertexShader, 2) {
     g_raw.start = a[1];
     g_raw.selected = a[0];
     g_raw.own_program = true;
+    g_raw.version++;
     static const bool log = std::getenv("STEAL_GEOM_LOG") != nullptr;
     static std::unordered_set<uint64_t> seen;
     if (log && seen.insert(uint64_t(a[0]) << 32 | a[1]).second)
@@ -1189,7 +1204,8 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
         LogQuadSource("arrays", a[0], a[1], a[2], mem::VirtualFromPhysical(g_raw.offset[0] & 0x7FFFFFFF),
                       g_raw.format[0] >> 8);
     LogApiQuads(a[0], a[1], a[2]);
-    if (g_backend) g_backend->Draw(DrawState(), a[0], a[1], a[2], nullptr);
+    VertexOverlay o;
+    if (g_backend) g_backend->Draw(DrawState(o), a[0], a[1], a[2], nullptr);
     return 0;
 }
 
@@ -1223,7 +1239,8 @@ HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     Walk(Dev(kDevPush));
     SyncDeferred();
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
-    if (g_backend) g_backend->Draw(DrawState(), a[0], 0, a[1], indices);
+    VertexOverlay o;
+    if (g_backend) g_backend->Draw(DrawState(o), a[0], 0, a[1], indices);
     return 0;
 }
 
@@ -1359,7 +1376,10 @@ bool ApplyRawMethod(uint32_t m, uint32_t v) {
     constexpr uint32_t kProgram = 0x0B00, kConstant = 0x0B80, kArrayOffset = 0x1720, kArrayFormat = 0x1760,
                        kProgramLoad = 0x1E9C, kProgramStart = 0x1EA0, kConstantLoad = 0x1EA4;
     if (m >= kProgram && m < kProgram + 0x80) {
-        if (g_raw.load < 136) g_raw.program[g_raw.load * 4 + g_raw.load_word] = v;
+        if (g_raw.load < 136) {
+            uint32_t& w = g_raw.program[g_raw.load * 4 + g_raw.load_word];
+            if (w != v) w = v, g_raw.version++;
+        }
         if (++g_raw.load_word == 4) {
             g_raw.load_word = 0;
             g_raw.load++;
@@ -1378,12 +1398,14 @@ bool ApplyRawMethod(uint32_t m, uint32_t v) {
         g_raw.offset[(m - kArrayOffset) / 4] = v;
         g_raw.arrays = true;
     } else if (m >= kArrayFormat && m < kArrayFormat + 0x40) {
-        g_raw.format[(m - kArrayFormat) / 4] = v;
+        uint32_t& f = g_raw.format[(m - kArrayFormat) / 4];
+        if (f != v) f = v, g_raw.version++;
         g_raw.arrays = true;
     } else if (m == kProgramLoad) {
         g_raw.load = v;
         g_raw.load_word = 0;
     } else if (m == kProgramStart) {
+        if (g_raw.start != v) g_raw.version++;
         g_raw.start = v;
         g_raw.own_program = true;
     } else if (m == kConstantLoad) {
@@ -1420,12 +1442,25 @@ void DirectInputs(uint32_t h, gpu::VertexShader& vs) {
     for (uint32_t n = 0; n < 16; n++) vs.stream_stride[n] = g_state.streams[n].stride;
 }
 
-gpu::State SelectedProgramState() {
-    gpu::State s = g_state;
+void SelectedProgramState(VertexOverlay& o) {
     auto it = g_vs.find(g_raw.selected);
     bool direct = DirectHandle(g_raw.selected);
-    if (it == g_vs.end() && !direct) return s;
-    std::vector<uint32_t> program;
+    if (it == g_vs.end() && !direct) return;
+    // the same program and handle as the draw before: its shader again (a direct handle's layout is the library's
+    // memory, read each time)
+    static uint32_t built = 0;
+    static const gpu::VertexShader* built_from = nullptr;
+    static std::shared_ptr<gpu::VertexShader> last;
+    const gpu::VertexShader* from = direct ? nullptr : it->second.get();
+    if (!direct && last && built == g_raw.version && built_from == from) {
+        o.Save();
+        g_state.vs = last;
+        g_state.vs_handle = 1;
+        return;
+    }
+    // the program's words into one buffer kept between draws (a vector grown each draw cost the heap's time)
+    static std::vector<uint32_t> program;
+    program.clear();
     for (uint32_t i = g_raw.start; i < 136; i++) {
         program.insert(program.end(), &g_raw.program[i * 4], &g_raw.program[i * 4 + 4]);
         if (g_raw.program[i * 4 + 3] & 1) break;  // the final instruction
@@ -1450,21 +1485,62 @@ gpu::State SelectedProgramState() {
         vs->program_type = 0x2078;
         vs->constants.clear();
     }
-    s.vs = vs;
-    s.vs_handle = 1;
-    return s;
+    built = g_raw.version, built_from = from, last = vs;
+    o.Save();
+    g_state.vs = vs;
+    g_state.vs_handle = 1;
 }
 
 // an API draw's vertex state: the title's own arrays and program, its program over the API's streams, or the API's
-gpu::State DrawState() {
-    if (g_raw.arrays) return RawDrawState();
-    if (g_raw.own_program && (g_vs.count(g_raw.selected) || DirectHandle(g_raw.selected))) return SelectedProgramState();
+const gpu::State& DrawState(VertexOverlay& o) {
+    if (g_raw.arrays) RawDrawState(o);
+    else if (g_raw.own_program && (g_vs.count(g_raw.selected) || DirectHandle(g_raw.selected))) SelectedProgramState(o);
     return g_state;
 }
 
-gpu::State RawDrawState() {
-    gpu::State s = g_state;
-    std::vector<uint32_t> program;
+void VertexOverlay::Save() {
+    if (on) return;
+    on = true;
+    vs = g_state.vs;
+    vs_handle = g_state.vs_handle;
+    base_vertex = g_state.base_vertex;
+    streams = g_state.streams;
+}
+VertexOverlay::~VertexOverlay() {
+    if (!on) return;
+    g_state.vs = std::move(vs);
+    g_state.vs_handle = vs_handle;
+    g_state.base_vertex = base_vertex;
+    g_state.streams = streams;
+}
+
+void RawDrawState(VertexOverlay& o) {
+    // the same program and formats as the draw before: its shader again
+    static uint32_t built = 0;
+    static std::shared_ptr<gpu::VertexShader> last;
+    if (!last || built != g_raw.version) {
+        last = RawProgram();
+        built = g_raw.version;
+    }
+    o.Save();
+    g_state.vs = last;
+    g_state.vs_handle = 1;
+    for (uint32_t r = 0; r < 16; r++) {
+        if (!g_raw.headers[r]) {
+            g_raw.headers[r] = mem::AllocSystem(20);
+            std::memset(HostPtr(g_raw.headers[r]), 0, 20);
+            W32(g_raw.headers[r], 1);  // a vertex buffer, one reference
+        }
+        W32(g_raw.headers[r] + 4, g_raw.offset[r] & 0x7FFFFFFF);  // bit 31 picks the second vertex DMA context
+        g_state.streams[r] = {g_raw.headers[r], g_raw.format[r] >> 8};
+    }
+    g_state.base_vertex = 0;
+}
+
+std::shared_ptr<gpu::VertexShader> RawProgram() {
+    // the program's words into one buffer kept between draws (a vector grown each draw cost the heap's time)
+    static std::vector<uint32_t> program;
+    program.clear();
     for (uint32_t i = g_raw.start; i < 136; i++) {
         program.insert(program.end(), &g_raw.program[i * 4], &g_raw.program[i * 4 + 4]);
         if (g_raw.program[i * 4 + 3] & 1) break;  // the final instruction
@@ -1488,19 +1564,7 @@ gpu::State RawDrawState() {
             vs->stream_stride[r] = f >> 8;
         }
     }
-    s.vs = vs;
-    s.vs_handle = 1;
-    for (uint32_t r = 0; r < 16; r++) {
-        if (!g_raw.headers[r]) {
-            g_raw.headers[r] = mem::AllocSystem(20);
-            std::memset(HostPtr(g_raw.headers[r]), 0, 20);
-            W32(g_raw.headers[r], 1);  // a vertex buffer, one reference
-        }
-        W32(g_raw.headers[r] + 4, g_raw.offset[r] & 0x7FFFFFFF);  // bit 31 picks the second vertex DMA context
-        s.streams[r] = {g_raw.headers[r], g_raw.format[r] >> 8};
-    }
-    s.base_vertex = 0;
-    return s;
+    return vs;
 }
 
 // XBE_PUSH_STATS=1: every 5 s, the hardware methods titles pushed themselves that Walk let pass
@@ -1699,9 +1763,11 @@ HLE_STDCALL(D3DDevice_RunPushBuffer, 2) {
                 vertices.clear();
             } else if (prim) {
                 if (wide) LOG_FIRST(4, "d3d: RunPushBuffer index above 65535 cut to 16 bits");
-                if (!indices.empty() && g_backend)
-                    g_backend->Draw(g_raw.arrays ? RawDrawState() : g_state, prim, 0, uint32_t(indices.size()),
-                                    reinterpret_cast<const uint8_t*>(indices.data()));
+                if (!indices.empty() && g_backend) {
+                    VertexOverlay o;
+                    if (g_raw.arrays) RawDrawState(o);
+                    g_backend->Draw(g_state, prim, 0, uint32_t(indices.size()), reinterpret_cast<const uint8_t*>(indices.data()));
+                }
                 if (!vertices.empty()) {
                     uint32_t stride = VertexBytes(), bytes = uint32_t(vertices.size()) * 4;
                     if (stride && bytes % stride == 0) DrawUp(prim, bytes / stride, vertices.data(), stride);

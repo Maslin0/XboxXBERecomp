@@ -311,9 +311,12 @@ private:
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
-        for (const Range& r : ranges_)
+        for (const Range& r : ranges_) {
+            // a range as it was, most of them each draw, in one pass
+            if (Same(reinterpret_cast<const uint8_t*>(&sent_) + r.off, now + r.off, r.len)) continue;
             for (size_t off = r.off, end = r.off + r.len; off < end; off += 64)
                 Delta(reinterpret_cast<const uint8_t*>(&sent_) + off, now + off, std::min<size_t>(64, end - off));
+        }
         std::array<uint32_t, 4> textures;
         for (size_t i = 0; i < 4; i++) textures[i] = Header(s.textures[i]);
         Delta(&sent_.textures, &textures, sizeof(textures));
