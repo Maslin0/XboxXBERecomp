@@ -15,6 +15,7 @@
 #include <toml++/toml.hpp>
 
 #include "app/app.h"
+#include "core/input.h"
 #include "core/log.h"
 
 namespace app {
@@ -57,6 +58,15 @@ void Load() {
     s.language = t["language"].value_or(s.language);
     s.full_picture = t["full_picture"].value_or(s.full_picture);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    // [keys]: control = [key, key] (virtual-key codes); a control left out keeps its default
+    if (const toml::table* keys = t["keys"].as_table()) {
+        for (int c = 0; c < input::kControls; c++) {
+            const toml::array* a = (*keys)[input::ControlId(c)].as_array();
+            if (!a) continue;
+            for (size_t k = 0; k < 2; k++)
+                input::Keys()[size_t(c)][k] = uint16_t(k < a->size() ? (*a)[k].value_or(int64_t(0)) : 0);
+        }
+    }
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
         else *o.value = t[o.key].value_or(*o.value);
@@ -83,6 +93,14 @@ toml::table Table() {
                   {"language", int64_t(s.language)},
                   {"full_picture", s.full_picture},
                   {"join_ip", s.join_ip}};
+    toml::table keys;
+    for (int c = 0; c < input::kControls; c++) {
+        toml::array a;
+        for (uint16_t vk : input::Keys()[size_t(c)])
+            if (vk) a.push_back(int64_t(vk));
+        keys.insert(input::ControlId(c), a);
+    }
+    t.insert("keys", keys);
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
         else t.insert(o.key, int64_t(*o.value));

@@ -3,6 +3,7 @@
 #include "core/input.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <initializer_list>
 #include <iterator>
 #include <mutex>
@@ -55,7 +56,7 @@ void UpdatePads() {
     }
 }
 
-// The keyboard as controller 1, while the game window has the focus:
+// The keyboard as controller 1, while the game window has the focus, by Keys(). By default:
 //   steer A D / Left Right (left stick), throttle W / Up (right trigger), brake S / Down (left trigger); W S and the
 //   arrows also move the left stick up and down for the menus
 //   A Enter Space, B Backspace, X Left Shift, Y Left Ctrl, black Q, white E, Start Esc, Back Tab,
@@ -65,46 +66,134 @@ void Keyboard(Pad& p) {
     p.connected = true;  // a controller is there for the game even with none plugged in
     HWND window = static_cast<HWND>(app::Window());
     if (!window || GetForegroundWindow() != window) return;
-    auto held = [](std::initializer_list<int> keys) {
-        for (int vk : keys)
-            if (GetAsyncKeyState(vk) & 0x8000) return true;
+    const KeyMap& keys = Keys();
+    auto held = [&](Control c) {
+        for (uint16_t vk : keys[size_t(c)])
+            if (vk && (GetAsyncKeyState(vk) & 0x8000)) return true;
         return false;
     };
     bool any = false;
-    auto button = [&](uint16_t bit, std::initializer_list<int> keys) {
-        if (held(keys)) p.buttons |= bit, any = true;
+    auto button = [&](uint16_t bit, Control c) {
+        if (held(c)) p.buttons |= bit, any = true;
     };
-    auto analog = [&](int i, std::initializer_list<int> keys) {
-        if (held(keys)) p.analog[i] = 0xFF, any = true;
+    auto analog = [&](int i, Control c) {
+        if (held(c)) p.analog[i] = 0xFF, any = true;
     };
-    auto axis = [&](int16_t& a, std::initializer_list<int> minus, std::initializer_list<int> plus) {
+    auto axis = [&](int16_t& a, Control minus, Control plus) {
         int v = (held(plus) ? 32767 : 0) - (held(minus) ? 32767 : 0);
         if (v) a = int16_t(v), any = true;
     };
-    axis(p.lx, {'A', VK_LEFT}, {'D', VK_RIGHT});
-    axis(p.ly, {'S', VK_DOWN}, {'W', VK_UP});
-    axis(p.rx, {'J'}, {'L'});
-    axis(p.ry, {'K'}, {'I'});
-    analog(7, {'W', VK_UP});
-    analog(6, {'S', VK_DOWN});
-    analog(0, {VK_RETURN, VK_SPACE});
-    analog(1, {VK_BACK});
-    analog(2, {VK_LSHIFT});
-    analog(3, {VK_LCONTROL});
-    analog(4, {'Q'});
-    analog(5, {'E'});
-    button(0x01, {VK_NUMPAD8});
-    button(0x02, {VK_NUMPAD2});
-    button(0x04, {VK_NUMPAD4});
-    button(0x08, {VK_NUMPAD6});
-    button(0x10, {VK_ESCAPE});
-    button(0x20, {VK_TAB});
-    button(0x40, {'F'});
-    button(0x80, {'R'});
+    axis(p.lx, Control::kStickLeft, Control::kStickRight);
+    axis(p.ly, Control::kStickDown, Control::kStickUp);
+    axis(p.rx, Control::kRightStickLeft, Control::kRightStickRight);
+    axis(p.ry, Control::kRightStickDown, Control::kRightStickUp);
+    analog(7, Control::kRightTrigger);
+    analog(6, Control::kLeftTrigger);
+    analog(0, Control::kA);
+    analog(1, Control::kB);
+    analog(2, Control::kX);
+    analog(3, Control::kY);
+    analog(4, Control::kBlack);
+    analog(5, Control::kWhite);
+    button(0x01, Control::kDpadUp);
+    button(0x02, Control::kDpadDown);
+    button(0x04, Control::kDpadLeft);
+    button(0x08, Control::kDpadRight);
+    button(0x10, Control::kStart);
+    button(0x20, Control::kBack);
+    button(0x40, Control::kLeftThumb);
+    button(0x80, Control::kRightThumb);
     p.keyboard = any;
 }
 
 }  // namespace
+
+const KeyMap& DefaultKeys() {
+    static const KeyMap keys = {{
+        {'A', VK_LEFT}, {'D', VK_RIGHT}, {'W', VK_UP}, {'S', VK_DOWN}, {'W', VK_UP}, {'S', VK_DOWN},
+        {VK_RETURN, VK_SPACE}, {VK_BACK, 0}, {VK_LSHIFT, 0}, {VK_LCONTROL, 0}, {'Q', 0}, {'E', 0},
+        {VK_ESCAPE, 0}, {VK_TAB, 0},
+        {VK_NUMPAD8, 0}, {VK_NUMPAD2, 0}, {VK_NUMPAD4, 0}, {VK_NUMPAD6, 0},
+        {'I', 0}, {'K', 0}, {'J', 0}, {'L', 0}, {'F', 0}, {'R', 0},
+    }};
+    return keys;
+}
+
+KeyMap& Keys() {
+    static KeyMap keys = DefaultKeys();
+    return keys;
+}
+
+const char* ControlId(int control) {
+    static const char* ids[kControls] = {
+        "stick_left", "stick_right", "stick_up", "stick_down", "right_trigger", "left_trigger",
+        "a", "b", "x", "y", "black", "white", "start", "back",
+        "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+        "right_stick_up", "right_stick_down", "right_stick_left", "right_stick_right", "left_thumb", "right_thumb",
+    };
+    return control >= 0 && control < kControls ? ids[control] : "";
+}
+
+const char* KeyName(uint16_t vk) {
+    static char buf[16];
+    if (!vk) return "";
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        buf[0] = char(vk);
+        buf[1] = 0;
+        return buf;
+    }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) {
+        std::snprintf(buf, sizeof(buf), "NUM %d", vk - VK_NUMPAD0);
+        return buf;
+    }
+    if (vk >= VK_F1 && vk <= VK_F24) {
+        std::snprintf(buf, sizeof(buf), "F%d", vk - VK_F1 + 1);
+        return buf;
+    }
+    switch (vk) {
+        case VK_RETURN: return "ENTER";
+        case VK_SPACE: return "SPACE";
+        case VK_BACK: return "BACKSPACE";
+        case VK_TAB: return "TAB";
+        case VK_ESCAPE: return "ESC";
+        case VK_LSHIFT: return "L SHIFT";
+        case VK_RSHIFT: return "R SHIFT";
+        case VK_LCONTROL: return "L CTRL";
+        case VK_RCONTROL: return "R CTRL";
+        case VK_LMENU: return "L ALT";
+        case VK_RMENU: return "R ALT";
+        case VK_UP: return "UP";
+        case VK_DOWN: return "DOWN";
+        case VK_LEFT: return "LEFT";
+        case VK_RIGHT: return "RIGHT";
+        case VK_INSERT: return "INSERT";
+        case VK_DELETE: return "DELETE";
+        case VK_HOME: return "HOME";
+        case VK_END: return "END";
+        case VK_PRIOR: return "PAGE UP";
+        case VK_NEXT: return "PAGE DOWN";
+        case VK_CAPITAL: return "CAPS LOCK";
+        case VK_MULTIPLY: return "NUM *";
+        case VK_ADD: return "NUM +";
+        case VK_SUBTRACT: return "NUM -";
+        case VK_DECIMAL: return "NUM .";
+        case VK_DIVIDE: return "NUM /";
+        case VK_OEM_1: return ";";
+        case VK_OEM_PLUS: return "=";
+        case VK_OEM_COMMA: return ",";
+        case VK_OEM_MINUS: return "-";
+        case VK_OEM_PERIOD: return ".";
+        case VK_OEM_2: return "/";
+        case VK_OEM_3: return "`";
+        case VK_OEM_4: return "[";
+        case VK_OEM_5: return "\\";
+        case VK_OEM_6: return "]";
+        case VK_OEM_7: return "'";
+        default:
+            std::snprintf(buf, sizeof(buf), "KEY %d", vk);
+            return buf;
+    }
+}
 
 void Init() {
     // WGI reads the triggers apart and HIDAPI takes PlayStation and Switch pads. Reads come from the guest's threads,
