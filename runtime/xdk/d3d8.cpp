@@ -1273,12 +1273,20 @@ uint32_t UpVertices(const void* src, uint32_t bytes) {
     return g_up_header;
 }
 
+uint32_t VertexBytes();
 void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride) {
     if (!g_backend || !count || !stride) return;
     SyncDeferred();
     auto stream = g_state.streams[0];
     g_state.streams[0] = {UpVertices(vertices, count * stride), stride};
-    g_backend->Draw(g_state, prim, 0, count, nullptr);
+    {
+        // a program the title selected itself (SelectVertexShader) after the format, with vertices of another size
+        // than the format's: they are the program's attributes (Double STEAL's zoom lens in cutscenes, a unit quad
+        // of 24 bytes under XYZRHW TEX2's 32, which drawn as the format filled one pixel)
+        VertexOverlay o;
+        if (g_raw.own_program && DirectHandle(g_raw.selected) && VertexBytes() != stride) SelectedProgramState(o);
+        g_backend->Draw(g_state, prim, 0, count, nullptr);
+    }
     g_state.streams[0] = stream;
 }
 
@@ -1342,7 +1350,32 @@ void EndPrimitive() {
             LOGE("immediate quads: %u vertices mask %X:%s", count, g_im_mask, line.c_str());
         }
     }
-    if (!(handle & 1) && (handle & 0xE) == 4) LOG_FIRST(1, "d3d: pretransformed immediate mode vertices are not supported");
+    // a fixed function format: each vertex packed in its layout (floats, colours as four bytes) and drawn through it,
+    // which keeps pretransformed positions (Double STEAL's zoom lens in cutscenes, a quad list of XYZRHW TEX2)
+    if (!(handle & 1)) {
+        gpu::VertexShader fvf;
+        gpu::FvfInputs(handle, fvf);
+        uint32_t stride = fvf.stream_stride[0];
+        if (!stride) return;
+        static std::vector<uint8_t> bytes;
+        bytes.assign(size_t(count) * stride, 0);
+        for (uint32_t v = 0; v < count; v++) {
+            for (uint32_t r = 0; r < 16; r++) {
+                const auto& in = fvf.inputs[r];
+                if (!in.type) continue;
+                const float* src = &g_im_vertices[v * 64 + r * 4];
+                uint8_t* dst = &bytes[size_t(v) * stride + in.offset];
+                uint32_t n = in.type >> 4;
+                if ((in.type & 0xF) == 2) {
+                    std::memcpy(dst, src, n * 4);
+                } else {
+                    for (uint32_t c = 0; c < 4; c++) dst[c] = uint8_t(std::clamp(src[c], 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+            }
+        }
+        DrawUp(prim, count, bytes.data(), stride);
+        return;
+    }
     auto bound = g_state.vs, from = handle & 1 ? bound : nullptr;
     Made& m = made[{from.get(), g_im_mask}];
     if (!m.vs) {
