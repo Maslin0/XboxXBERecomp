@@ -58,6 +58,10 @@ std::unique_ptr<Backend> CreateBackend();
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner);
 // the render thread's handle once it runs (for a profiler to sample), else null
 void* RenderThread();
+// a visibility report's count each time the GPU writes it, by the report's address: what a title asking while the next
+// test into it is still pending is answered with (d3d8's GetVisibilityTestResult)
+void NoteReport(uint32_t va, uint32_t count);
+bool LastReport(uint32_t va, uint32_t& count);
 
 // perf diagnostic: the title's thread recording for the render thread, and waiting on it
 inline std::atomic<uint64_t> g_perf_capture_ns{0}, g_perf_wait_ns{0}, g_perf_waits{0};

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -1702,10 +1703,31 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
     return a[0];
 }
 
+namespace gpu {
+namespace {
+std::mutex g_reports_lock;
+std::unordered_map<uint32_t, uint32_t> g_report_counts;
+}  // namespace
+
+void NoteReport(uint32_t va, uint32_t count) {
+    std::lock_guard<std::mutex> lock(g_reports_lock);
+    g_report_counts[va] = count;
+}
+
+bool LastReport(uint32_t va, uint32_t& count) {
+    std::lock_guard<std::mutex> lock(g_reports_lock);
+    auto it = g_report_counts.find(va);
+    if (it == g_report_counts.end()) return false;
+    count = it->second;
+    return true;
+}
+}  // namespace gpu
+
 // (index, result out, timestamp out): a report still pending is flushed through, as the console's GPU would
 // have reached it by the time a title spins on it. Flushing waits for the render thread and the GPU to finish
 // everything queued (Double STEAL's lens flares ask every other frame: up to 7 ms of a frame), so a pending report
-// whose index answered before answers with that count again, a frame or two old; only a first one flushes.
+// that the GPU wrote before answers with the count it wrote last, a frame or two old (noted as the GPU writes it:
+// by the time the title asks, its next test into the report is pending again); only a first one flushes.
 // XBE_EXACT_REPORTS=1 always flushes.
 HLE_STDCALL(D3DDevice_GetVisibilityTestResult, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -1714,21 +1736,17 @@ HLE_STDCALL(D3DDevice_GetVisibilityTestResult, 3) {
     if (!block) return 0x88760828u;  // D3DERR_TESTINCOMPLETE
     uint32_t report = block + (a[0] & 0xFF) * 16;
     static const bool exact = std::getenv("XBE_EXACT_REPORTS") != nullptr;
-    static std::unordered_map<uint32_t, uint32_t> last;  // index to its last count
-    if (R32(report + 12) == 0xFFFFFFFFu && !exact) {
-        auto it = last.find(a[0]);
-        if (it != last.end()) {
-            if (a[1]) W32(a[1], it->second);
-            if (a[2]) {
-                W32(a[2], R32(report));
-                W32(a[2] + 4, R32(report + 4));
-            }
-            return 0;
+    uint32_t count = 0;
+    if (R32(report + 12) == 0xFFFFFFFFu && !exact && gpu::LastReport(report, count)) {
+        if (a[1]) W32(a[1], count);
+        if (a[2]) {
+            W32(a[2], R32(report));
+            W32(a[2] + 4, R32(report + 4));
         }
+        return 0;
     }
     if (R32(report + 12) == 0xFFFFFFFFu && g_backend) g_backend->Flush();
     if (R32(report + 12) == 0xFFFFFFFFu) return 0x88760828u;
-    last[a[0]] = R32(report + 8);
     if (a[1]) W32(a[1], R32(report + 8));
     if (a[2]) {
         W32(a[2], R32(report));
