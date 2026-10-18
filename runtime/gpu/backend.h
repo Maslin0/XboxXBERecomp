@@ -27,6 +27,9 @@ public:
     virtual void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects_va,
                       uint32_t dst_points_va) = 0;
     virtual void Present(const Surface& front) = 0;
+    // the title's thread after a present, before it reads its pads for the next frame: waits while the screen has a
+    // frame queued already (so the pads read next are shown as soon as they can be)
+    virtual void WaitFrameSlot() {}
     // the CPU is about to touch this resource's memory: write GPU results back first
     virtual void Sync(uint32_t data_va, uint32_t size) = 0;
     // a lock that does not wait for the GPU (NOOVERWRITE): a result a frame or two old is what the console gives too
@@ -62,6 +65,13 @@ void* RenderThread();
 // test into it is still pending is answered with (d3d8's GetVisibilityTestResult)
 void NoteReport(uint32_t va, uint32_t count);
 bool LastReport(uint32_t va, uint32_t& count);
+
+// latency diagnostic (XBE_LATENCY_LOG=1): when the title last read a pad, carried with each frame it presents (title's
+// thread) to that frame's present on the swap chain (render thread)
+bool LatencyLog();
+inline std::atomic<int64_t> g_pad_read_ns{0};  // steady clock
+void NoteFramePad();
+int64_t TakeFramePad();
 
 // perf diagnostic: the title's thread recording for the render thread, and waiting on it
 inline std::atomic<uint64_t> g_perf_capture_ns{0}, g_perf_wait_ns{0}, g_perf_waits{0};

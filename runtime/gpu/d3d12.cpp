@@ -503,6 +503,9 @@ public:
         h = guest_h_;
     }
     uint64_t Presents() const override { return presents_; }
+    void WaitFrameSlot() override {
+        if (frame_wait_) WaitForSingleObjectEx(frame_wait_, 1000, TRUE);
+    }
 
 private:
     struct Frame {
@@ -655,6 +658,7 @@ private:
     bool EnsureSmaaLookups();
     bool EnsureSmaaTargets(uint32_t w, uint32_t h);
     void RenderUi();
+    void LogLatency(int64_t pad_ns);
     void ReleaseOldTextures();
     void ResetFrame();
     void CountFps();
@@ -856,6 +860,15 @@ private:
     std::vector<Query> counted_;  // since the last ClearReport
     std::deque<Report> reports_;
     bool tearing_ = false;
+    HANDLE frame_wait_ = nullptr;  // the swap chain's frame latency object: signalled when a frame may be queued
+    static int FrameLatency() {  // 0: the swap chain's default (three frames, no object)
+        static const char* env = std::getenv("XBE_FRAME_LATENCY");
+        return env ? std::clamp(std::atoi(env), 0, 16) : 1;
+    }
+    UINT SwapFlags() const {
+        return (FrameLatency() ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0) |
+               (tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    }
     uint64_t presents_ = 0;
     double fps_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
@@ -924,7 +937,7 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = kFrames;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    sd.Flags = SwapFlags();
     ComPtr<IDXGISwapChain1> sc1;
     if (FAILED(factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1))) {
         LOGE("d3d12: no swap chain");
@@ -932,6 +945,13 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     }
     factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
     sc1.As(&swap_);
+    // the title paces itself to 60 a second, a little faster than many screens: by default the swap chain then queues
+    // three frames ahead of the screen. One frame is queued at most, the title waiting for its turn after a present,
+    // before it reads its pads (WaitFrameSlot): a pad read to its picture on a 60 Hz screen 69 -> 50 ms (mission 1,
+    // XBE_LATENCY_LOG). Waiting on the render thread instead gave 58 ms. XBE_FRAME_LATENCY=<frames>, 0 the default.
+    if (UINT latency = FrameLatency(); latency && SUCCEEDED(swap_->SetMaximumFrameLatency(latency)))
+        frame_wait_ = swap_->GetFrameLatencyWaitableObject();
+    LOGI("d3d12: frame latency %d%s", FrameLatency(), frame_wait_ ? "" : " (the swap chain's own)");
     return true;
 }
 
@@ -3565,7 +3585,7 @@ void D3D12Backend::ResizeSwap() {
         if (f.fence) WaitFence(f.fence);
     }
     for (auto& b : bb_) b.Reset();
-    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, SwapFlags());
     CreateBackBufferViews();
     bb_w_ = w;
     bb_h_ = h;
@@ -3918,6 +3938,7 @@ void D3D12Backend::Present(const Surface& front) {
     auto perf_swap = PerfClock::now();
     swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
     g_perf.swap += PerfMs(perf_swap);
+    if (LatencyLog()) LogLatency(TakeFramePad());
 
     presents_++;
     presents_seen_.store(presents_);
@@ -3927,6 +3948,51 @@ void D3D12Backend::Present(const Surface& front) {
     CountFps();
     if (diag::Perf()) LogPerf();
     ApplySettings();
+}
+
+// XBE_LATENCY_LOG=1, each second: from the title's last pad read before a frame to the refresh that put that frame on
+// the screen (the swap chain's statistics: the present count shown last and when), and to its present returning
+void D3D12Backend::LogLatency(int64_t pad_ns) {
+    struct Sent {
+        UINT count;
+        int64_t pad_ns, present_ns;
+    };
+    static std::deque<Sent> sent;
+    static double sum_shown = 0, max_shown = 0, sum_present = 0;
+    static uint32_t shown = 0, n = 0;
+    static auto start = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    UINT last = 0;
+    if (pad_ns && SUCCEEDED(swap_->GetLastPresentCount(&last))) {
+        sent.push_back({last, pad_ns, now_ns});
+        sum_present += (now_ns - pad_ns) / 1e6;
+        n++;
+        while (sent.size() > 32) sent.pop_front();
+    }
+    DXGI_FRAME_STATISTICS st{};
+    if (SUCCEEDED(swap_->GetFrameStatistics(&st))) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        int64_t shown_ns = int64_t(double(st.SyncQPCTime.QuadPart) * 1e9 / double(f.QuadPart));
+        while (!sent.empty() && sent.front().count <= st.PresentCount) {
+            if (sent.front().count == st.PresentCount) {
+                double ms = (shown_ns - sent.front().pad_ns) / 1e6;
+                sum_shown += ms;
+                max_shown = std::max(max_shown, ms);
+                shown++;
+            }
+            sent.pop_front();
+        }
+    }
+    if (now - start >= std::chrono::seconds(1)) {
+        if (n)
+            LOGE("latency: pad read -> on screen %.1f ms (max %.1f, %u frames timed), -> present %.1f ms, %u frames",
+                 shown ? sum_shown / shown : 0.0, max_shown, shown, sum_present / n, n);
+        start = now;
+        sum_shown = max_shown = sum_present = 0;
+        shown = n = 0;
+    }
 }
 
 void D3D12Backend::ApplySettings() {

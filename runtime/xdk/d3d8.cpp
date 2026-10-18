@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -537,7 +538,9 @@ HLE_STDCALL(D3DDevice_UpdateOverlay, 5) {
     }
     gpu::MarkDirty(g_overlay);  // written here, not through a lock: the target takes the new pixels
     if (app::kGame.presenting) app::kGame.presenting();
+    gpu::NoteFramePad();
     g_backend->Present(SurfaceOf(g_overlay));
+    g_backend->WaitFrameSlot();
     return 0;
 }
 HLE_STDCALL(D3DDevice_GetOverlayUpdateStatus, 0) { return 1; }
@@ -635,7 +638,9 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     Walk(Dev(kDevPush));  // reports asked for at the end of the frame
     if (g_backend) {
         if (app::kGame.presenting) app::kGame.presenting();
+        gpu::NoteFramePad();
         g_backend->Present(SurfaceOf(g_buffers[1]));
+        g_backend->WaitFrameSlot();
     }
     // D3DRS_PRESENTATIONINTERVAL from the library's table: a title whose logic counts frames (30 fps under
     // D3DPRESENT_INTERVAL_TWO) keeps its speed; IMMEDIATE (bit 31) and DEFAULT (0) wait one vblank at most
@@ -1749,6 +1754,28 @@ std::unordered_map<uint32_t, uint32_t> g_report_counts;
 void NoteReport(uint32_t va, uint32_t count) {
     std::lock_guard<std::mutex> lock(g_reports_lock);
     g_report_counts[va] = count;
+}
+
+bool LatencyLog() {
+    static const bool on = std::getenv("XBE_LATENCY_LOG") != nullptr;
+    return on;
+}
+namespace {
+std::mutex g_frame_pads_lock;
+std::deque<int64_t> g_frame_pads;
+}  // namespace
+void NoteFramePad() {
+    if (!LatencyLog()) return;
+    std::lock_guard<std::mutex> lock(g_frame_pads_lock);
+    g_frame_pads.push_back(g_pad_read_ns.load());
+    while (g_frame_pads.size() > 16) g_frame_pads.pop_front();
+}
+int64_t TakeFramePad() {
+    std::lock_guard<std::mutex> lock(g_frame_pads_lock);
+    if (g_frame_pads.empty()) return 0;
+    int64_t t = g_frame_pads.front();
+    g_frame_pads.pop_front();
+    return t;
 }
 
 bool LastReport(uint32_t va, uint32_t& count) {

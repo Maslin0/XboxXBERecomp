@@ -191,6 +191,8 @@ public:
         last_present_ = id;
     }
 
+    void WaitFrameSlot() override { inner_->WaitFrameSlot(); }  // any thread: the swap chain's own object
+
     void Sync(uint32_t data, uint32_t) override { ReadBack(data, false); }
 
     void SyncLate(uint32_t data) override {

@@ -2,6 +2,7 @@
 #include <chrono>
 
 #include "core/input.h"
+#include "gpu/backend.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
 
@@ -91,6 +92,9 @@ HLE_STDCALL(XInputGetState, 2) {
         port = it->second.port;
     }
     input::Pad p = input::Poll(int(port));
+    if (gpu::LatencyLog())
+        gpu::g_pad_read_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch()).count();
     if (!p.connected) return 1167;  // ERROR_DEVICE_NOT_CONNECTED
     std::lock_guard<std::mutex> lock(g_ports_lock);
     Handle& h = g_handles[a[0]];
