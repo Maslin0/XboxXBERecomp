@@ -577,6 +577,17 @@ private:
         uint32_t w = 0, h = 0;
     };
     std::unordered_map<uint32_t, DepthColour> depth_colour_;
+    // a cube texture whose faces were rendered to: the faces' targets copied into one
+    ID3D12Resource* CubeFromTargets(const TextureDesc& d, int stage, DrawTextures& stages);
+    struct TargetCube {
+        ComPtr<ID3D12Resource> res;
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+        uint32_t w = 0;
+        DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+        uint64_t copied[6] = {};  // each face's target's written as copied
+    };
+    std::unordered_map<uint32_t, TargetCube> target_cubes_;
+    uint64_t writes_ = 0;  // counts the GPU's writes to targets (Target::written)
     ID3D12Resource* BindGuestTexture(const State& s, int stage, const TextureDesc& d, const FormatInfo& fi,
                                      DrawTextures& stages);
     bool CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t key);
@@ -1239,6 +1250,7 @@ bool D3D12Backend::BindTargets(const State& s) {
         if (LatchCpuWrite(*rt)) UploadTarget(*rt, s.rt);
         Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
         rt->drawn = true;
+        rt->written = ++writes_;
         if (rt->gw * rt->gh <= 64 * 64) small_drawn_.insert(rt->data);
     }
     if (ds) {
@@ -1313,6 +1325,7 @@ void D3D12Backend::DrawDepthCopy(Target& src, Target& dst, ID3D12PipelineState* 
     std::memcpy(cb.cpu, uv, 4 * sizeof(float));
     DrawFullScreen(pso, cb.gpu, slot);
     dst.drawn = true;
+    dst.written = ++writes_;
     bound_rt_ = bound_ds_ = nullptr;
 }
 
@@ -2318,7 +2331,59 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
         auto dit = targets_.find(SizedTargetKey(d.data, true, d.width, d.height));
         if (dit != targets_.end() && &dit->second != draw_ds_) return DepthAsColour(dit->second, stage, stages);
     }
+    if (d.cube && !fi.depth && !fi.compressed) {
+        if (ID3D12Resource* cube = CubeFromTargets(d, stage, stages)) return cube;
+    }
     return BindGuestTexture(s, stage, d, fi, stages);
+}
+
+// A cube texture the title renders each face of (Double STEAL's car reflections, a 128x128 cube redrawn around the
+// car): guest memory never holds what was drawn, so the faces' targets are copied into a cube of their size, a face
+// again once its target was drawn since. Only the top level: the title draws no other.
+ID3D12Resource* D3D12Backend::CubeFromTargets(const TextureDesc& d, int stage, DrawTextures& stages) {
+    Target* face[6] = {};
+    Target* first = nullptr;
+    for (uint32_t f = 0; f < 6; f++) {
+        auto it = targets_.find(SizedTargetKey(d.data + f * FaceSize(d), false, d.width, d.height));
+        if (it == targets_.end() || it->second.depth || it->second.w != it->second.h) continue;
+        face[f] = &it->second;
+        if (!first) first = face[f];
+    }
+    if (!first) return nullptr;
+    TargetCube& c = target_cubes_[d.data];
+    if (!c.res || c.w != first->w || c.fmt != first->fmt) {
+        if (c.res) CurrentFrame().garbage.push_back(c.res);
+        c = TargetCube{};
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC td = Texture2DDesc(first->fmt, first->w, first->w);
+        td.DepthOrArraySize = 6;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, c.state, nullptr, IID_PPV_ARGS(&c.res))))
+            return nullptr;
+        c.w = first->w;
+        c.fmt = first->fmt;
+    }
+    for (uint32_t f = 0; f < 6; f++) {
+        Target* t = face[f];
+        if (!t || t->w != c.w || t->fmt != c.fmt || t->written == c.copied[f]) continue;
+        if (t == draw_rt_) continue;
+        Transition(t->res.Get(), t->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(c.res.Get(), c.state, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION dst{c.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        dst.SubresourceIndex = f;
+        D3D12_TEXTURE_COPY_LOCATION src{t->res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        src.SubresourceIndex = 0;
+        cl_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        c.copied[f] = t->written;
+    }
+    Transition(c.res.Get(), c.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[stage];
+    sv.Format = c.fmt;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+    sv.TextureCube.MipLevels = 1;
+    sv.TextureCube.MostDetailedMip = 0;
+    sv.TextureCube.ResourceMinLODClamp = 0;
+    stages.info[stage].kind = kTexCube;
+    return c.res.Get();
 }
 
 // D3DTEXF: 1 point, 2 linear, 3 anisotropic
@@ -2809,9 +2874,10 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
                                const DrawTextures& stages) {
     fprintf(cap_,
             "%04u draw rt %08X/%X ds %08X prim %u count %u vs %08X ps %08X blend %u %X %X zen %u %X zwrite %u "
-            "zbias %d %.2f cull %u cw %X c0 %.3f %.3f %.3f %.3f",
+            "zbias %d %.2f cull %u cw %X fog %g %g %g %g spec %u c0 %.3f %.3f %.3f %.3f",
             cap_i_++, s.rt.data, s.rt.format, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
-            k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
+            k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.fog[0], c.fog[1], c.fog[2],
+            c.fog[3], s.rs[kRsSpecularEnable], c.pc[0][0], c.pc[0][1],
             c.pc[0][2], c.pc[0][3]);
     CaptureTextures(s, stages);
 }
@@ -3280,6 +3346,7 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         cl_->ClearRenderTargetView(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), col, UINT(rs.size()), rs.data());
     }
     t.drawn = true;
+    t.written = ++writes_;
 }
 
 void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
@@ -3409,6 +3476,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
         Blit(src_res, src_t.fmt, uv, o);
     }
     dst_t.drawn = true;
+    dst_t.written = ++writes_;
     bound_rt_ = bound_ds_ = nullptr;
 }
 
@@ -3446,6 +3514,7 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
         cl_->CopyTextureRegion(&dl, dx, dy, 0, &sl, &b);
     }
     dst_t.drawn = true;
+    dst_t.written = ++writes_;
     bound_rt_ = bound_ds_ = nullptr;
 }
 
