@@ -56,6 +56,8 @@ private:
 std::unique_ptr<Backend> CreateBackend();
 // the same backend driven from a thread of its own: calls return once recorded
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner);
+// the render thread's handle once it runs (for a profiler to sample), else null
+void* RenderThread();
 
 // perf diagnostic: the title's thread recording for the render thread, and waiting on it
 inline std::atomic<uint64_t> g_perf_capture_ns{0}, g_perf_wait_ns{0}, g_perf_waits{0};

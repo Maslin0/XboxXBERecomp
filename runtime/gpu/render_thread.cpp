@@ -12,6 +12,7 @@
 #include <smmintrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -31,6 +32,8 @@
 namespace gpu {
 
 namespace {
+
+std::atomic<void*> g_render_thread{nullptr};  // its handle, for profilers
 
 // commands handed over at once, so the render thread keeps close behind and a wait is short
 constexpr uint32_t kBatchCommands = 64;
@@ -391,6 +394,9 @@ private:
         if (auto set = reinterpret_cast<SetDescription>(
                 reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription"))))
             set(GetCurrentThread(), L"render");
+        HANDLE me = nullptr;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &me, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        g_render_thread = me;
         for (;;) {
             Batch* b;
             {
@@ -485,6 +491,8 @@ private:
 };
 
 }  // namespace
+
+void* RenderThread() { return g_render_thread.load(); }
 
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner) { return std::make_unique<Threaded>(std::move(inner)); }
 

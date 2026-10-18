@@ -1703,15 +1703,32 @@ HLE_STDCALL(D3DDevice_EndPush, 1) {
 }
 
 // (index, result out, timestamp out): a report still pending is flushed through, as the console's GPU would
-// have reached it by the time a title spins on it
+// have reached it by the time a title spins on it. Flushing waits for the render thread and the GPU to finish
+// everything queued (Double STEAL's lens flares ask every other frame: up to 7 ms of a frame), so a pending report
+// whose index answered before answers with that count again, a frame or two old; only a first one flushes.
+// XBE_EXACT_REPORTS=1 always flushes.
 HLE_STDCALL(D3DDevice_GetVisibilityTestResult, 3) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Walk(Dev(kDevPush));
     uint32_t dev = R32(kDevicePtr), block = R32(dev + XDK_CDevice_VisibilityReports + (a[0] >> 8) * 4);
     if (!block) return 0x88760828u;  // D3DERR_TESTINCOMPLETE
     uint32_t report = block + (a[0] & 0xFF) * 16;
+    static const bool exact = std::getenv("XBE_EXACT_REPORTS") != nullptr;
+    static std::unordered_map<uint32_t, uint32_t> last;  // index to its last count
+    if (R32(report + 12) == 0xFFFFFFFFu && !exact) {
+        auto it = last.find(a[0]);
+        if (it != last.end()) {
+            if (a[1]) W32(a[1], it->second);
+            if (a[2]) {
+                W32(a[2], R32(report));
+                W32(a[2] + 4, R32(report + 4));
+            }
+            return 0;
+        }
+    }
     if (R32(report + 12) == 0xFFFFFFFFu && g_backend) g_backend->Flush();
     if (R32(report + 12) == 0xFFFFFFFFu) return 0x88760828u;
+    last[a[0]] = R32(report + 8);
     if (a[1]) W32(a[1], R32(report + 8));
     if (a[2]) {
         W32(a[2], R32(report));
