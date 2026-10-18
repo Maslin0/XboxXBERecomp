@@ -536,6 +536,7 @@ HLE_STDCALL(D3DDevice_UpdateOverlay, 5) {
         }
     }
     gpu::MarkDirty(g_overlay);  // written here, not through a lock: the target takes the new pixels
+    if (app::kGame.presenting) app::kGame.presenting();
     g_backend->Present(SurfaceOf(g_overlay));
     return 0;
 }
@@ -632,7 +633,10 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         }
     }
     Walk(Dev(kDevPush));  // reports asked for at the end of the frame
-    if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
+    if (g_backend) {
+        if (app::kGame.presenting) app::kGame.presenting();
+        g_backend->Present(SurfaceOf(g_buffers[1]));
+    }
     // D3DRS_PRESENTATIONINTERVAL from the library's table: a title whose logic counts frames (30 fps under
     // D3DPRESENT_INTERVAL_TWO) keeps its speed; IMMEDIATE (bit 31) and DEFAULT (0) wait one vblank at most
     uint32_t interval = R32(kRenderState + gpu::kRsPresentationInterval * 4);

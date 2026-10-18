@@ -102,6 +102,9 @@ struct GameInfo {
     void (*ui)(double fps);        // each frame inside the ImGui frame, UiLock held
     void (*pad)(int port, input::Pad& pad);  // a polled pad before the game gets it
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
+    // the title's thread, as it hands a frame to be shown: what it drew for that frame is complete. The frames reach
+    // ui in the same order, one ui call each
+    void (*presenting)();
     // where the title draws inside its back buffer, left for a TV's overscan around it: x, y, width, height, then
     // the back buffer's width and height; all 0 when it draws the whole buffer
     uint32_t safe_area[6] = {};
