@@ -382,6 +382,32 @@ bool Repackable(const Inputs& inputs) {
     return true;
 }
 
+// n bytes (1 to 16) from src to dst in at most two loads and stores, overlapping, never past either end: an element
+// of a vertex, where a memcpy call per element was most of the repacking's time
+inline void CopySmall(uint8_t* dst, const uint8_t* src, uint32_t n) {
+    if (n >= 8) {
+        uint64_t a, b;
+        std::memcpy(&a, src, 8);
+        std::memcpy(&b, src + n - 8, 8);
+        std::memcpy(dst, &a, 8);
+        std::memcpy(dst + n - 8, &b, 8);
+    } else if (n >= 4) {
+        uint32_t a, b;
+        std::memcpy(&a, src, 4);
+        std::memcpy(&b, src + n - 4, 4);
+        std::memcpy(dst, &a, 4);
+        std::memcpy(dst + n - 4, &b, 4);
+    } else if (n >= 2) {
+        uint16_t a, b;
+        std::memcpy(&a, src, 2);
+        std::memcpy(&b, src + n - 2, 2);
+        std::memcpy(dst, &a, 2);
+        std::memcpy(dst + n - 2, &b, 2);
+    } else if (n) {
+        *dst = *src;
+    }
+}
+
 // the guest's bytes moved into dword aligned slots, one interleaved buffer, the formats kept: what the input assembler
 // can't read in place (strides of 10, 11, 14 bytes) without converting each element to a float4
 bool AssembleRepacked(const State& s, const Inputs& inputs, const DrawRange& d, Assembled& out) {
@@ -410,14 +436,31 @@ bool AssembleRepacked(const State& s, const Inputs& inputs, const DrawRange& d, 
     }
     bool dense = uint64_t(d.span) <= uint64_t(d.count) * kDenseSpanPerVertex + kDenseSpanSlack;
     uint32_t n = dense ? d.span : d.count;
+    // kept between draws, never cleared: a slot's bytes past its element are not read
     auto& g = out.gathered[0];
-    g.assign(size_t(n) * stride, 0);
-    for (uint32_t v = 0; v < n; v++) {
-        uint32_t id = dense ? d.first_vertex + v : DrawVertex(s, d, v);
-        uint8_t* o = &g[size_t(v) * stride];
-        for (int k = 0; k < inputs.nregs; k++) {
-            const Element& e = el[k];
-            std::memcpy(o + e.offset, e.src + size_t(id) * e.stride, e.bytes);
+    if (g.size() < size_t(n) * stride) g.resize(size_t(n) * stride);
+    int nregs = inputs.nregs;
+    bool big = false;
+    for (int k = 0; k < nregs; k++) big |= el[k].bytes > 16;
+    if (dense && !big) {
+        // a run of vertices: each element's source steps by its stride
+        const uint8_t* src[16];
+        for (int k = 0; k < nregs; k++) src[k] = el[k].src + size_t(d.first_vertex) * el[k].stride;
+        uint8_t* o = g.data();
+        for (uint32_t v = 0; v < n; v++, o += stride) {
+            for (int k = 0; k < nregs; k++) {
+                CopySmall(o + el[k].offset, src[k], el[k].bytes);
+                src[k] += el[k].stride;
+            }
+        }
+    } else {
+        for (uint32_t v = 0; v < n; v++) {
+            uint32_t id = dense ? d.first_vertex + v : DrawVertex(s, d, v);
+            uint8_t* o = &g[size_t(v) * stride];
+            for (int k = 0; k < nregs; k++) {
+                const Element& e = el[k];
+                std::memcpy(o + e.offset, e.src + size_t(id) * e.stride, e.bytes);
+            }
         }
     }
     out.buffer_count = 1;
